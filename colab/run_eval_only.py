@@ -223,7 +223,7 @@ def main() -> int:
     student.eval()
 
     print("[eval] 3. Evaluating held-out Lookahead L->L+3 Top-8 Recall...", flush=True)
-    val_batches = _collect_val_batches(tokenizer, num_batches=12, seq_len=512, batch_size=2)
+    val_batches = collect_packed_eval_batches(tokenizer, num_batches=12, seq_len=512, batch_size=2)
     with amp_ctx:
         lookahead_recall = evaluate_lookahead_recall(student, lookahead_bank, val_batches, device)
     print(f"[eval] lookahead_top8_recall={lookahead_recall:.4f}", flush=True)

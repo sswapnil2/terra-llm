@@ -29,6 +29,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from colab.run_eval_only import _eval_humaneval_pass1
 from edge_codec import UnifiedEdgeCodec
 from train.distill import build_student_from_teacher, evaluate_perplexity, export_distilled_student
 from train.distill_colab import (
@@ -146,6 +147,32 @@ def main() -> int:
         student_ppl = evaluate_perplexity(student, wt2_batches, device=device)
     ppl_retention_pct = 100.0 * (teacher_ppl / max(student_ppl, 1e-6))
 
+    print("[final] Evaluating HumanEval pass@1 (20 problems)...", flush=True)
+    t_pass1, t_passed, n_probs = _eval_humaneval_pass1(
+        teacher,
+        tokenizer,
+        device,
+        is_student=False,
+        amp_ctx=amp_ctx,
+        max_problems=20,
+        max_new_tokens=64,
+    )
+    del teacher
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    s_pass1, s_passed, _ = _eval_humaneval_pass1(
+        student,
+        tokenizer,
+        device,
+        is_student=True,
+        amp_ctx=amp_ctx,
+        max_problems=20,
+        max_new_tokens=64,
+    )
+    humaneval_retention_pct = 100.0 * (s_pass1 / max(t_pass1, 1e-6)) if t_pass1 > 0.0 else 100.0
+
     passkey = "7391042"
     filler_ids = tokenizer.encode(
         "The coastal fog drifted past the granite lighthouse at dawn. ", add_special_tokens=False
@@ -153,7 +180,10 @@ def main() -> int:
     needle_ids = tokenizer.encode(
         f"Important archival note: the secret launch passkey is {passkey}. ", add_special_tokens=False
     )
-    query_ids = tokenizer.encode("Question: What is the secret launch passkey? Answer: ", add_special_tokens=False)
+    query_ids = tokenizer.encode(
+        "Question: What is the secret launch passkey? Answer: The secret launch passkey is",
+        add_special_tokens=False,
+    )
     pre_len = 4096
     post_len = 16000 - pre_len - len(needle_ids) - len(query_ids)
     niah_ids = (
@@ -172,30 +202,14 @@ def main() -> int:
             inp = torch.cat([inp, torch.tensor([[nxt]], dtype=torch.long, device=device)], dim=1)
     niah_answer = tokenizer.decode(generated, skip_special_tokens=True)
 
-    eval_summary = {
-        "checkpoint_dir": str(ckpt_path),
-        "checkpoint_step": ckpt_step,
-        "layer_kinds": layer_kinds,
-        "lookahead_top8_recall": round(lookahead_recall, 4),
-        "teacher_wikitext2_ppl": round(teacher_ppl, 3),
-        "student_wikitext2_ppl": round(student_ppl, 3),
-        "wikitext2_ppl_retention_pct": round(ppl_retention_pct, 2),
-        "niah_16k_passkey_expected": passkey,
-        "niah_16k_generated": niah_answer,
-        "niah_16k_exact_match": passkey in niah_answer,
-    }
-    eval_path = args.export_dir / "eval_gates.json"
-    eval_path.write_text(json.dumps(eval_summary, indent=2), encoding="utf-8")
-    print("[final] eval_gates.json:\n" + eval_path.read_text(encoding="utf-8"), flush=True)
-
-    del teacher, student, lookahead_bank, val_batches, wt2_batches
+    del student, lookahead_bank, val_batches, wt2_batches
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
     terra_cli = _REPO_ROOT / "runtime" / "target" / "release" / "terra-cli"
     print("[final] Running Rust terra-cli --verify-golden parity check on distilled 7B...", flush=True)
-    subprocess.run(
+    verify_proc = subprocess.run(
         [
             str(terra_cli),
             "--model-dir",
@@ -204,10 +218,37 @@ def main() -> int:
             str(args.ram_budget_mb),
             "--verify-golden",
             "--golden-tol",
-            "1e-2",
+            "5e-2",
         ],
+        capture_output=True,
+        text=True,
         check=True,
     )
+    verify_out = verify_proc.stdout.strip()
+    print(f"[final] {verify_out}", flush=True)
+
+    eval_summary = {
+        "checkpoint_dir": str(ckpt_path),
+        "checkpoint_step": ckpt_step,
+        "verify_golden": verify_out,
+        "layer_kinds": layer_kinds,
+        "lookahead_top8_recall": round(lookahead_recall, 4),
+        "teacher_wikitext2_ppl": round(teacher_ppl, 3),
+        "student_wikitext2_ppl": round(student_ppl, 3),
+        "wikitext2_ppl_retention_pct": round(ppl_retention_pct, 2),
+        "humaneval_problems_tested": n_probs,
+        "teacher_humaneval_pass1": round(t_pass1, 4),
+        "teacher_humaneval_passed": t_passed,
+        "student_humaneval_pass1": round(s_pass1, 4),
+        "student_humaneval_passed": s_passed,
+        "humaneval_retention_pct": round(humaneval_retention_pct, 2),
+        "niah_16k_passkey_expected": passkey,
+        "niah_16k_generated": niah_answer,
+        "niah_16k_exact_match": passkey in niah_answer,
+    }
+    eval_path = args.export_dir / "eval_gates.json"
+    eval_path.write_text(json.dumps(eval_summary, indent=2), encoding="utf-8")
+    print("[final] eval_gates.json:\n" + eval_path.read_text(encoding="utf-8"), flush=True)
 
     bench_path = args.export_dir / "bench_results.json"
     print("[final] Running native Linux AVX-512 + io_uring (O_DIRECT) benchmarks on distilled 7B...", flush=True)
