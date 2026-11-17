@@ -125,6 +125,7 @@ def main() -> int:
     from colab.run_eval_only import _eval_humaneval_pass1
     from train.distill import build_student_from_teacher, evaluate_perplexity, export_distilled_student
     from train.distill_colab import (
+        anchor_layers_from_checkpoint,
         collect_packed_eval_batches,
         detect_gpu_profile,
         evaluate_lookahead_recall,
@@ -152,6 +153,7 @@ def main() -> int:
     )
     student, lookahead_bank, layer_kinds = build_student_from_teacher(
         cpu_base,
+        anchor_layers=anchor_layers_from_checkpoint(ckpt_path),
         use_rms_prescale=False,
         init_l2_scale=False,
         enable_hint_embedding=True,

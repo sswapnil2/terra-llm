@@ -57,8 +57,12 @@ from train.hybrid_ssm import (
     GatedLinearRecurrenceAttention,
     MicroTerraHybridWrapper,
     build_document_causal_mask,
+    default_anchor_layers,
 )
 from train.lookahead_router import LookaheadRouterBank
+
+# Documents [0, EVAL_RESERVED_DOCS) of each corpus stream are validation-only; training starts after.
+EVAL_RESERVED_DOCS = 2048
 
 
 def stochastic_round_bf16(x_f32: torch.Tensor) -> torch.Tensor:
@@ -428,6 +432,13 @@ def configure_training_stage(
     return 2, q_lam, l2_prescaled
 
 
+def anchor_layers_from_checkpoint(ckpt_path: Path) -> tuple[int, ...] | None:
+    """GQA anchor layer indices recorded in a checkpoint (`None` for older checkpoints = default 7:1)."""
+    meta = json.loads((ckpt_path / "trainer_state.json").read_text(encoding="utf-8"))
+    kinds = meta.get("metrics", {}).get("layer_kinds")
+    return None if kinds is None else tuple(i for i, k in enumerate(kinds) if int(k) == 0)
+
+
 def save_atomic_checkpoint(
     ckpt_root: Path,
     step: int,
@@ -605,8 +616,16 @@ def stream_annotated_batches(
     code_ratio: float = 0.35,
     use_edge_hints: bool = True,
     skip_first_docs: int = 0,
+    skip_prose_docs: int | None = None,
+    skip_code_docs: int | None = None,
+    progress: dict[str, int] | None = None,
 ):
-    """Yield `(input_ids [B, T], hints [B, T, 4] | None, eos_reset_mask [B, T])` via dense packing."""
+    """Yield `(input_ids [B, T], hints [B, T, 4] | None, eos_reset_mask [B, T])` via dense packing.
+
+    `skip_prose_docs` / `skip_code_docs` (default: `skip_first_docs`) are absolute stream offsets.
+    `progress`, when given, is updated in place with the absolute index of the next unread document
+    in each stream (`prose_docs`, `code_docs`), so a resumed run can skip exactly what was consumed.
+    """
     from datasets import load_dataset
 
     codec = None
@@ -629,9 +648,16 @@ def stream_annotated_batches(
             load_dataset("codeparrot/codeparrot-clean-valid", split="train", streaming=True)
         )
 
-    for _ in range(skip_first_docs):
+    n_prose = skip_first_docs if skip_prose_docs is None else skip_prose_docs
+    n_code = skip_first_docs if skip_code_docs is None else skip_code_docs
+    for _ in range(n_prose):
         next(prose_ds, None)
+    for _ in range(n_code):
         next(code_ds, None)
+    if progress is None:
+        progress = {}
+    progress["prose_docs"] = n_prose
+    progress["code_docs"] = n_code
 
     eos_id = int(tokenizer.eos_token_id if getattr(tokenizer, "eos_token_id", None) is not None else 0)
     is_fast = bool(getattr(tokenizer, "is_fast", False))
@@ -652,6 +678,7 @@ def stream_annotated_batches(
             sample = next(code_ds) if use_code else next(prose_ds)
         except StopIteration:
             break
+        progress["code_docs" if use_code else "prose_docs"] += 1
         text = sample.get("content") or sample.get("text") or ""
         if len(text.strip()) < 64:
             continue
@@ -708,10 +735,15 @@ def collect_packed_eval_batches(
     num_batches: int = 12,
     seq_len: int = 512,
     batch_size: int = 2,
-    skip_first_docs: int = 64,
+    skip_first_docs: int = 0,
     use_edge_hints: bool = True,
 ) -> list[tuple[torch.LongTensor, torch.Tensor | None, torch.Tensor]]:
-    """Collect finite held-out packed validation batches without unmasked `<eos>` right-padding."""
+    """Collect held-out packed validation batches from the reserved head of each stream.
+
+    Validation reads documents `[skip_first_docs, EVAL_RESERVED_DOCS)`; training starts at
+    `EVAL_RESERVED_DOCS`, so the two never overlap. Raises if validation would spill past the reserve.
+    """
+    progress: dict[str, int] = {}
     stream = stream_annotated_batches(
         tokenizer,
         seq_len=seq_len,
@@ -719,8 +751,16 @@ def collect_packed_eval_batches(
         code_ratio=0.30,
         use_edge_hints=use_edge_hints,
         skip_first_docs=skip_first_docs,
+        progress=progress,
     )
-    return [next(stream) for _ in range(num_batches)]
+    batches = [next(stream) for _ in range(num_batches)]
+    used = max(progress["prose_docs"], progress["code_docs"])
+    if used > EVAL_RESERVED_DOCS:
+        raise ValueError(
+            f"validation consumed {used} docs, past EVAL_RESERVED_DOCS={EVAL_RESERVED_DOCS}; "
+            "raise the reserve or use fewer eval batches"
+        )
+    return batches
 
 
 @torch.no_grad()
@@ -1031,6 +1071,12 @@ def main() -> None:
         help="Raise RuntimeError immediately if checkpoint verification status is FAIL (default: True)",
     )
     parser.add_argument("--no-edge-hints", action="store_true")
+    parser.add_argument(
+        "--anchor-every",
+        type=int,
+        default=8,
+        help="Keep every Nth layer as exact GQA (8 = 7:1 hybrid, 4 = 3:1, 2 = 1:1, 1 = no recurrence)",
+    )
     parser.add_argument("--dry-run-mini", action="store_true", help="Run tiny local smoke test verifying checkpoint & resume")
     args = parser.parse_args()
 
@@ -1127,6 +1173,9 @@ def main() -> None:
         )
         student, lookahead_bank, layer_kinds = build_student_from_teacher(
             cpu_base,
+            anchor_layers=default_anchor_layers(
+                cpu_base.config.num_hidden_layers, block_ratio=args.anchor_every
+            ),
             use_rms_prescale=False,
             init_l2_scale=False,
             enable_hint_embedding=not args.no_edge_hints,
@@ -1148,19 +1197,9 @@ def main() -> None:
             num_batches=max(1, args.verify_batches),
             seq_len=min(args.seq_len, 512),
             batch_size=args.batch_size,
-            skip_first_docs=128,
             use_edge_hints=not args.no_edge_hints,
         )
-        batch_iter = (
-            None
-            if args.verify_only
-            else stream_annotated_batches(
-                tokenizer,
-                seq_len=args.seq_len,
-                batch_size=args.batch_size,
-                use_edge_hints=not args.no_edge_hints,
-            )
-        )
+        batch_iter = None  # created after resume so it can skip already-trained documents
         mini_batches = []
 
     stage1_param_ids = collect_stage1_param_ids(student, lookahead_bank)
@@ -1190,6 +1229,18 @@ def main() -> None:
                 saved_metrics = json.loads(state_file.read_text(encoding="utf-8")).get("metrics", {})
             except Exception:
                 saved_metrics = {}
+    data_progress: dict[str, int] = {}
+    if not args.dry_run_mini and not args.verify_only:
+        # Training never reads the validation reserve; on resume it continues after the docs already used.
+        batch_iter = stream_annotated_batches(
+            tokenizer,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            use_edge_hints=not args.no_edge_hints,
+            skip_prose_docs=max(EVAL_RESERVED_DOCS, int(saved_metrics.get("data_prose_docs", 0))),
+            skip_code_docs=max(EVAL_RESERVED_DOCS, int(saved_metrics.get("data_code_docs", 0))),
+            progress=data_progress,
+        )
     l2_prescaled = (
         bool(saved_metrics.get("l2_prescaled", 0.0))
         or float(saved_metrics.get("quant_lambda", 0.0)) >= 1.0 - 1e-6
@@ -1384,6 +1435,10 @@ def main() -> None:
                 )
 
         if is_save_step:
+            last_metrics["layer_kinds"] = list(layer_kinds)
+            if data_progress:
+                last_metrics["data_prose_docs"] = data_progress["prose_docs"]
+                last_metrics["data_code_docs"] = data_progress["code_docs"]
             ckpt_path = save_atomic_checkpoint(
                 args.ckpt_dir,
                 step_idx,
