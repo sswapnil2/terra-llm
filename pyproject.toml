@@ -1,0 +1,22 @@
+[project]
+name = "micro-terra"
+version = "0.1.0"
+description = "Micro-TERRA: 1.58-bit Ternary Hybrid Recurrent + MoE Training & Export Suite"
+readme = "ANTIGRAVITY.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "torch>=2.5.0",
+    "transformers>=4.46.0",
+    "datasets>=3.0.0",
+    "accelerate>=1.0.0",
+    "safetensors>=0.4.5",
+    "huggingface-hub>=0.26.0",
+    "numpy>=1.26.0",
+    "onnxruntime>=1.19.0",
+    "psutil>=6.0.0",
+    "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["exporter", "train", "edge_codec"]
+pythonpath = ["."]

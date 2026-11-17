@@ -1,0 +1,26 @@
+[package]
+name = "terra-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Micro-TERRA bare-metal 1.58-bit ternary SIMD + io_uring / F_NOCACHE inference engine"
+
+[lib]
+name = "terra_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "terra-cli"
+path = "src/bin/terra_cli.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.4"
+half = "2.4"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"

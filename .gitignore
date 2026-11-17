@@ -1,0 +1,32 @@
+# Python virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Rust build artifacts (keep Cargo.lock, ignore target/)
+target/
+**/target/
+
+# Model shards, checkpoints, and temporary runtime directories
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.onnx
+terra_ckpt_local/
+exported/
+/tmp_*
+
+# macOS & IDE metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.vscode/
+.idea/
