@@ -1251,8 +1251,13 @@ def main() -> None:
     grad_accum = 1 if args.dry_run_mini else max(1, args.grad_accum)
     last_metrics: dict[str, Any] = {"verification": init_report}
     all_trainable_params = list(student.parameters()) + list(lookahead_bank.parameters())
-    early_s1_step = start_step + args.early_verify_step if args.early_verify_step > 0 else -1
-    early_s2_step = stage1_steps + args.early_verify_step if args.early_verify_step > 0 else -1
+    exp_verify_steps: set[int] = set()
+    if args.early_verify_step > 0:
+        for base_step in (start_step, stage1_steps):
+            offset = args.early_verify_step
+            while base_step + offset <= args.steps:
+                exp_verify_steps.add(base_step + offset)
+                offset *= 2
 
     for step_idx in range(start_step + 1, args.steps + 1):
         step_t0 = time.perf_counter()
@@ -1342,7 +1347,7 @@ def main() -> None:
             )
 
         is_save_step = (step_idx % args.save_every == 0) or (step_idx == args.steps)
-        is_early_verify = step_idx in (early_s1_step, early_s2_step)
+        is_early_verify = step_idx in exp_verify_steps
 
         if is_save_step or is_early_verify:
             v_report, prev_probes = verify_checkpoint_health(
