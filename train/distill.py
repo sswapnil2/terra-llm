@@ -160,7 +160,7 @@ def build_student_from_teacher(
     teacher: OlmoeForCausalLM,
     anchor_layers: tuple[int, ...] | None = None,
     use_rms_prescale: bool = False,
-    init_l2_scale: bool = False,
+    init_l2_scale: bool = True,
     lookahead_offset: int = 3,
     enable_hint_embedding: bool = True,
     deepcopy_model: bool = True,

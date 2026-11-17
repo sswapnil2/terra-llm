@@ -12,6 +12,7 @@ flow strictly through differentiable additive embeddings during distillation.
 from __future__ import annotations
 
 from contextlib import nullcontext
+import copy
 import math
 from typing import Sequence
 
@@ -158,11 +159,27 @@ class GatedLinearRecurrenceAttention(nn.Module):
         block.k_proj = attn.k_proj
         block.v_proj = attn.v_proj
         block.o_proj = attn.o_proj
-        block.q_norm = attn.q_norm
-        block.k_norm = attn.k_norm
+        block.q_norm = copy.deepcopy(attn.q_norm)
+        block.k_norm = copy.deepcopy(attn.k_norm)
 
         param_ref = next(attn.parameters())
         block.decay_proj = block.decay_proj.to(device=param_ref.device, dtype=torch.float32)
+
+        # Normalize per-head query RMSNorm weights by `(1 - alpha_0)` so the unnormalized
+        # recurrent horizon `sum_{tau<=t} alpha_h^{t-tau} = 1 / (1 - alpha_h)` has unit
+        # convex-combination gain at Step 0, matching Softmax Attention output variance.
+        with torch.no_grad():
+            alpha0 = torch.sigmoid(block.decay_proj.bias.detach()).to(
+                device=block.q_norm.weight.device, dtype=block.q_norm.weight.dtype
+            )
+            horizon_scale = (
+                (1.0 - alpha0)
+                .unsqueeze(-1)
+                .expand(block.num_heads, block.head_dim)
+                .reshape(-1)
+            )
+            if block.q_norm.weight.numel() == horizon_scale.numel():
+                block.q_norm.weight.mul_(horizon_scale)
         return block
 
     def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
