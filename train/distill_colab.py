@@ -1058,6 +1058,11 @@ def main() -> None:
         action="store_true",
         help="Recurrence layers erase the old value for a key before writing (delta rule) instead of only adding",
     )
+    parser.add_argument(
+        "--write-gate",
+        action="store_true",
+        help="Recurrence layers learn a per-token importance that scales how strongly each token is written",
+    )
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=8)
@@ -1142,10 +1147,12 @@ def main() -> None:
             enable_hint_embedding=not args.no_edge_hints,
             deepcopy_model=True,
         )
-        if args.delta_rule:
-            for mod in student.modules():
-                if isinstance(mod, GatedLinearRecurrenceAttention):
+        for mod in student.modules():
+            if isinstance(mod, GatedLinearRecurrenceAttention):
+                if args.delta_rule:
                     mod.enable_delta_rule()
+                if args.write_gate:
+                    mod.enable_write_gate()
         teacher = teacher.to(device)
         student = student.to(device)
 
@@ -1196,10 +1203,12 @@ def main() -> None:
             # A100-40GB memory budget: keep core BitLinear, norms, routers, decay_proj,
             # and hint_embedding in FP32 while storing large BitLinearExperts in BF16.
             stochastic_round_bf16_params_(student)
-        if args.delta_rule:
-            for mod in student.modules():
-                if isinstance(mod, GatedLinearRecurrenceAttention):
+        for mod in student.modules():
+            if isinstance(mod, GatedLinearRecurrenceAttention):
+                if args.delta_rule:
                     mod.enable_delta_rule()
+                if args.write_gate:
+                    mod.enable_write_gate()
         if hasattr(student.backbone, "gradient_checkpointing_enable"):
             student.backbone.gradient_checkpointing_enable()
         student = student.to(device)

@@ -195,6 +195,18 @@ class GatedLinearRecurrenceAttention(nn.Module):
         nn.init.zeros_(self.erase_proj.weight)
         nn.init.constant_(self.erase_proj.bias, init_bias)
 
+    def enable_write_gate(self, init_bias: float = 4.0) -> None:
+        """Scale each token's write by a learned per-head importance `g = sigmoid(write_proj(h))`.
+
+        `S += g * k v^T`, so unimportant tokens barely touch the memory. `init_bias = 4`
+        (`g ~= 0.98`) keeps the warm start. ponytail: learned end to end; supervise it with the
+        teacher's received attention if it does not learn to discriminate on its own.
+        """
+        ref = self.decay_proj.weight
+        self.write_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True).to(ref.device, torch.float32)
+        nn.init.zeros_(self.write_proj.weight)
+        nn.init.constant_(self.write_proj.bias, init_bias)
+
     def _erase_gate(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """Per-token, per-head erase strength `beta` in `(0, 1)` (`[B, T, H]`), or None for the additive rule."""
         if getattr(self, "erase_proj", None) is None:
@@ -230,6 +242,9 @@ class GatedLinearRecurrenceAttention(nn.Module):
         amp_off = torch.amp.autocast("cuda", enabled=False) if hidden_states.is_cuda else nullcontext()
         with amp_off:
             alpha = torch.sigmoid(self.decay_proj(hidden_states.float()))  # [B, T, H]
+            if getattr(self, "write_proj", None) is not None:
+                # Gating v is the same as gating the write k v^T; both forward paths pick it up here.
+                v = v * torch.sigmoid(self.write_proj(hidden_states.float())).unsqueeze(-1)
         return q, k, v, alpha
 
     def forward_parallel(
