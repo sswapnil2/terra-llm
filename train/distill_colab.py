@@ -44,6 +44,8 @@ from train.bitlinear import (
     BitLinear,
     BitLinearExperts,
     apply_l2_optimal_model_prescale_,
+    mark_model_l2_prescaled_,
+    set_model_ternary_l2_scale,
     set_model_quant_lambda,
 )
 from train.distill import (
@@ -163,7 +165,11 @@ class StochasticBF16AdamW(torch.optim.Optimizer):
 
                     g_f32 = g_sl.float()
                     m_f32 = mq_sl.float() * ms_sl
-                    v_sqrt_f32 = vq_sl.float() * vs_sl
+                    # Code 0 means "somewhere in [0, half a step)", not "exactly zero". Decoding it as
+                    # zero lets a non-zero momentum be divided by `eps` alone on a step with no gradient
+                    # (an expert that was not routed), a ~200x oversized update. Use the top of the
+                    # interval instead, which keeps the update within 8-bit rounding of exact Adam's.
+                    v_sqrt_f32 = vq_sl.float().clamp_min_(0.5) * vs_sl
 
                     m_f32.mul_(beta1).add_(g_f32, alpha=1.0 - beta1)
                     v_f32 = (v_sqrt_f32 * v_sqrt_f32).mul_(beta2).addcmul_(g_f32, g_f32, value=1.0 - beta2)
@@ -932,6 +938,10 @@ def verify_checkpoint_health(
     if active_quant_lambda >= 1.0 - 1e-6:
         val_ppl_ternary = val_ppl_active
     else:
+        # Before lambda reaches 1 the weights are not row-prescaled, so plain `absmean` at lambda=1
+        # would score a ~25%-too-small scale that training never targets. Score the L2-optimal
+        # ternary form instead: the same function the model computes right after the prescale.
+        set_model_ternary_l2_scale(student, True)
         set_model_quant_lambda(student, 1.0)
         tern_nll = 0.0
         tern_toks = 0
@@ -949,6 +959,7 @@ def verify_checkpoint_health(
                 tern_nll += nll
                 tern_toks += n_tok
         val_ppl_ternary = math.exp(min(20.0, tern_nll / max(tern_toks, 1)))
+        set_model_ternary_l2_scale(student, False)
         set_model_quant_lambda(student, active_quant_lambda)
 
     probe_ids = val_batches[0][0][:1, : min(16, int(val_batches[0][0].shape[1]))].to(device)
@@ -1283,6 +1294,8 @@ def main() -> None:
         or float(saved_metrics.get("quant_lambda", 0.0)) >= 1.0 - 1e-6
         or start_step >= (stage1_steps + quant_warmup_steps)
     )
+    # The prescale record is not in `state_dict`; restore it so it can never be applied twice.
+    mark_model_l2_prescaled_(student, l2_prescaled)
 
     use_amp = gpu_profile["backend"] == "cuda"
     amp_ctx = (

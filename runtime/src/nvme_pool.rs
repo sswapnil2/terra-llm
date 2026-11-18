@@ -601,29 +601,66 @@ pub fn open_default_reader(
 // Fixed-Capacity RAM-Budgeted `ExpertLruPool`
 // ============================================================================
 
+/// Every acquisition of a required expert lands in exactly one of
+/// `cache_hits`, `prefetched_hits`, `stale_prefetch_hits`, `prefetch_late`, `cold_misses`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PrefetchMetrics {
+    /// Resident because an earlier acquisition loaded it.
     pub cache_hits: u64,
+    /// Resident because a prefetch issued *during this token* completed in time.
+    /// This is the only counter that credits the lookahead router.
     pub prefetched_hits: u64,
+    /// Resident because of a prefetch issued in an *earlier* token (cache warming, not prediction).
+    pub stale_prefetch_hits: u64,
+    /// Needed while its read was still in flight: the acquisition stalled on it.
+    pub prefetch_late: u64,
     pub cold_misses: u64,
     pub prefetch_requests: u64,
     pub evictions: u64,
     pub prefetch_stall_us: u64,
     pub bytes_read_nvme: u64,
+    /// Subset of `bytes_read_nvme` read speculatively.
+    pub prefetch_bytes_read: u64,
+    /// Speculatively read bytes that were used at their target layer in the token that requested them.
+    pub prefetch_useful_bytes: u64,
+    /// CRC32 + invalid-crumb validation time, spent on the inference thread for every load.
+    pub validate_us: u64,
 }
 
 impl PrefetchMetrics {
     pub fn total_acquisitions(&self) -> u64 {
-        self.cache_hits + self.prefetched_hits + self.cold_misses
+        self.cache_hits
+            + self.prefetched_hits
+            + self.stale_prefetch_hits
+            + self.prefetch_late
+            + self.cold_misses
     }
 
+    /// Fraction of acquisitions that found the expert resident (no stall), whatever put it there.
     pub fn effective_hit_rate(&self) -> f64 {
         let total = self.total_acquisitions();
         if total == 0 {
             1.0
         } else {
-            ((self.cache_hits + self.prefetched_hits) as f64) / (total as f64)
+            ((self.cache_hits + self.prefetched_hits + self.stale_prefetch_hits) as f64)
+                / (total as f64)
         }
+    }
+
+    /// Fraction of speculatively read bytes used at their target layer in the token that requested
+    /// them. A lookahead router with no predictive power scores about `top_k / num_experts` here.
+    pub fn prefetch_precision(&self) -> f64 {
+        if self.prefetch_bytes_read == 0 {
+            0.0
+        } else {
+            (self.prefetch_useful_bytes as f64) / (self.prefetch_bytes_read as f64)
+        }
+    }
+
+    /// Speculative bytes that did not serve the token that requested them.
+    pub fn prefetch_wasted_bytes(&self) -> u64 {
+        self.prefetch_bytes_read.saturating_sub(self.prefetch_useful_bytes)
     }
 }
 
@@ -642,7 +679,8 @@ enum SlotState {
         buf: AlignedBuffer,
         last_used_tick: u64,
         pinned: bool,
-        prefetched_unused: bool,
+        /// `Some(token)` while a speculative read issued during `token` has not been used yet.
+        prefetch_token: Option<u64>,
     },
 }
 
@@ -651,6 +689,7 @@ struct InFlightMeta {
     layer_id: usize,
     expert_id: usize,
     from_prefetch: bool,
+    prefetch_token: u64,
     queued_tick: u64,
 }
 
@@ -664,6 +703,7 @@ pub struct ExpertLruPool {
     in_flight_meta: HashMap<u64, InFlightMeta>,
     next_req_id: u64,
     tick: u64,
+    current_token: u64,
     metrics: PrefetchMetrics,
 }
 
@@ -686,6 +726,13 @@ impl ExpertLruPool {
         )?;
         let queue_depth = (max_cached_experts * 2).max(16);
         let reader = open_default_reader(experts_path, queue_depth)?;
+        if !reader.direct_io_active() {
+            eprintln!(
+                "terra-runtime: WARNING: unbuffered I/O unavailable for {}; using buffered reads. \
+                 The OS page cache will hold expert bytes OUTSIDE --ram-budget-mb.",
+                experts_path.display()
+            );
+        }
         Self::with_reader(directory, reader, top_k, max_cached_experts)
     }
 
@@ -727,6 +774,7 @@ impl ExpertLruPool {
             free_buffers,
             in_flight_meta: HashMap::with_capacity(cap),
             next_req_id: 1,
+            current_token: 0,
             tick: 1,
             metrics: PrefetchMetrics::default(),
         })
@@ -792,6 +840,11 @@ impl ExpertLruPool {
     #[inline]
     pub fn metrics(&self) -> &PrefetchMetrics {
         &self.metrics
+    }
+
+    /// Marks a token boundary: prefetches issued before this call no longer count as lookahead hits.
+    pub fn begin_token(&mut self) {
+        self.current_token += 1;
     }
 
     pub fn reset_metrics(&mut self) {
@@ -888,6 +941,8 @@ impl ExpertLruPool {
         // Harvest any background prefetches that already completed before measuring stalls!
         self.poll_completions(0)?;
 
+        let padded_bytes = self.directory.header.expert_padded_bytes as u64;
+        let current_token = self.current_token;
         let mut need_wait = false;
         let mut misses_to_submit: Vec<(usize, usize)> = Vec::new();
         let mut seen = Vec::with_capacity(required_experts.len());
@@ -905,19 +960,22 @@ impl ExpertLruPool {
                 SlotState::Resident {
                     last_used_tick,
                     pinned,
-                    prefetched_unused,
+                    prefetch_token,
                     ..
                 } => {
-                    if *prefetched_unused {
-                        self.metrics.prefetched_hits += 1;
-                        *prefetched_unused = false;
-                    } else {
-                        self.metrics.cache_hits += 1;
+                    match prefetch_token.take() {
+                        Some(t) if t == current_token => {
+                            self.metrics.prefetched_hits += 1;
+                            self.metrics.prefetch_useful_bytes += padded_bytes;
+                        }
+                        Some(_) => self.metrics.stale_prefetch_hits += 1,
+                        None => self.metrics.cache_hits += 1,
                     }
                     *pinned = true;
                     *last_used_tick = tick;
                 }
                 SlotState::InFlight => {
+                    self.metrics.prefetch_late += 1;
                     need_wait = true;
                 }
                 SlotState::Evicted => {
@@ -983,12 +1041,12 @@ impl ExpertLruPool {
                 SlotState::Resident {
                     last_used_tick,
                     pinned,
-                    prefetched_unused,
+                    prefetch_token,
                     ..
                 } => {
-                    if *prefetched_unused {
-                        self.metrics.prefetched_hits += 1;
-                        *prefetched_unused = false;
+                    // Already counted above as `prefetch_late` (stalled on it) or `cold_misses`.
+                    if prefetch_token.take() == Some(current_token) {
+                        self.metrics.prefetch_useful_bytes += padded_bytes;
                     }
                     *pinned = true;
                     *last_used_tick = tick;
@@ -1039,8 +1097,9 @@ impl ExpertLruPool {
         if let Some(buf) = self.free_buffers.pop() {
             return Some(buf);
         }
-        // For speculative prefetch, only evict unpinned Resident slots whose prefetch was already consumed
-        // (`!prefetched_unused`), picking the least-recently-used (`last_used_tick` min).
+        // For speculative prefetch, only evict unpinned Resident slots that are not this token's own
+        // pending prefetches, picking the least-recently-used (`last_used_tick` min).
+        let current = Some(self.current_token);
         let victim_idx = self
             .slots
             .iter()
@@ -1049,9 +1108,9 @@ impl ExpertLruPool {
                 SlotState::Resident {
                     last_used_tick,
                     pinned: false,
-                    prefetched_unused: false,
+                    prefetch_token,
                     ..
-                } => Some((idx, *last_used_tick)),
+                } if *prefetch_token != current => Some((idx, *last_used_tick)),
                 _ => None,
             })
             .min_by_key(|&(_, tick)| tick)
@@ -1065,8 +1124,9 @@ impl ExpertLruPool {
             if let Some(buf) = self.free_buffers.pop() {
                 return Ok(buf);
             }
-            // Prefer evicting unpinned already-consumed experts (`prefetched_unused == false`),
-            // falling back to unpinned `prefetched_unused == true` only if the pool is completely tight.
+            // Prefer evicting unpinned experts that are not this token's pending prefetches,
+            // falling back to those only if the pool is completely tight.
+            let current = Some(self.current_token);
             let victim_idx = self
                 .slots
                 .iter()
@@ -1075,12 +1135,12 @@ impl ExpertLruPool {
                     SlotState::Resident {
                         last_used_tick,
                         pinned: false,
-                        prefetched_unused,
+                        prefetch_token,
                         ..
-                    } => Some((idx, *prefetched_unused, *last_used_tick)),
+                    } => Some((idx, *prefetch_token == current, *last_used_tick)),
                     _ => None,
                 })
-                .min_by_key(|&(_, prefetched_unused, tick)| (prefetched_unused, tick))
+                .min_by_key(|&(_, pending_prefetch, tick)| (pending_prefetch, tick))
                 .map(|(idx, _, _)| idx);
 
             if let Some(idx) = victim_idx {
@@ -1150,6 +1210,7 @@ impl ExpertLruPool {
                 layer_id,
                 expert_id,
                 from_prefetch,
+                prefetch_token: self.current_token,
                 queued_tick,
             },
         );
@@ -1210,7 +1271,11 @@ impl ExpertLruPool {
             }
 
             self.metrics.bytes_read_nvme += actual_bytes as u64;
+            if meta.from_prefetch {
+                self.metrics.prefetch_bytes_read += actual_bytes as u64;
+            }
 
+            let validate_start = Instant::now();
             let actual_crc = crc32fast::hash(&item.buf[..entry.payload_bytes as usize]);
             if actual_crc != entry.crc32 {
                 self.slots[meta.flat_idx] = SlotState::Evicted;
@@ -1238,12 +1303,14 @@ impl ExpertLruPool {
                 continue;
             }
 
+            self.metrics.validate_us += validate_start.elapsed().as_micros() as u64;
+
             debug_assert!(item.buf.is_page_aligned());
             self.slots[meta.flat_idx] = SlotState::Resident {
                 buf: item.buf,
                 last_used_tick: meta.queued_tick,
                 pinned: false,
-                prefetched_unused: meta.from_prefetch,
+                prefetch_token: meta.from_prefetch.then_some(meta.prefetch_token),
             };
         }
 

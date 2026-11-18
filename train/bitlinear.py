@@ -74,7 +74,12 @@ def apply_l2_optimal_row_prescale_(weight: torch.Tensor) -> torch.Tensor:
 
     Because `absmean_quantize` is positive-scale-equivariant (`Q(c * w) = c * Q(w)` for `c > 0`),
     multiplying row `r` by `c_r = <w_r, t_r> / (gamma_r * ||t_r||_2^2)` leaves the ternary
-    mask `t_r` invariant while making `gamma_r * t_r` minimize `||w_r - gamma * t_r||_2^2`.
+    mask `t_r` invariant while making `gamma_r * t_r` minimize `||w_r - gamma * t_r||_2^2`
+    for the weights as they were BEFORE this call.
+
+    NOT idempotent: the rescaled row is not its own fixed point, so a second call multiplies
+    by `c_r` again (about 1.34x on Gaussian rows). Call it exactly once per weight, through
+    `apply_l2_optimal_model_prescale_` / `from_linear(init_l2_scale=True)`, which track that.
     """
     w_f32 = weight.float()
     _, t, gamma = absmean_quantize_ste(w_f32)
@@ -96,10 +101,19 @@ def _quantize_act_with_lambda(x_in: torch.Tensor, quant_lambda: float) -> torch.
     return x_in + float(quant_lambda) * (x_q - x_in)
 
 
-def _quantize_weight_with_lambda(weight: torch.Tensor, quant_lambda: float) -> torch.Tensor:
+def _quantize_weight_with_lambda(
+    weight: torch.Tensor, quant_lambda: float, l2_scale: bool = False
+) -> torch.Tensor:
+    """Blend `weight` toward its ternary form.
+
+    At `quant_lambda >= 1` the plain `absmean` scale is used, which is only the L2-optimal one
+    after the row prescale has been applied. `l2_scale=True` computes the L2-optimal scale
+    explicitly instead: that is the quantizer the ramp is converging to, so it is the right way
+    to score pure-ternary quality on weights that have not been prescaled yet.
+    """
     if quant_lambda <= 0.0:
         return weight
-    if quant_lambda >= 1.0:
+    if quant_lambda >= 1.0 and not l2_scale:
         w_q, _, _ = absmean_quantize_ste(weight)
         return w_q
     # During progressive ramp (0 < quant_lambda < 1), use L2-optimal ternary scale
@@ -113,18 +127,43 @@ def _quantize_weight_with_lambda(weight: torch.Tensor, quant_lambda: float) -> t
     mult = torch.where(nz_sq > 0, dot / denom, torch.ones_like(dot)).clamp(0.5, 4.0)
     w_opt = (t_f32 * (gamma.unsqueeze(-1) * mult)).to(dtype=weight.dtype)
     w_q = weight + (w_opt - weight).detach()
+    if quant_lambda >= 1.0:
+        return w_q
     return weight + float(quant_lambda) * (w_q - weight)
 
 
 @torch.no_grad()
 def apply_l2_optimal_model_prescale_(model: nn.Module) -> None:
-    """Apply idempotent L2-optimal row prescaling across all BitLinear / BitLinearExperts modules."""
+    """Apply L2-optimal row prescaling once to every BitLinear / BitLinearExperts module.
+
+    The row prescale itself compounds if repeated, so each module records that it was prescaled
+    and is skipped on later calls. The record is a Python attribute, not part of `state_dict`:
+    after loading a checkpoint, the caller must restore it (`mark_model_l2_prescaled_`) before
+    calling this again.
+    """
     for mod in model.modules():
+        if not isinstance(mod, (BitLinear, BitLinearExperts)) or mod.l2_prescaled:
+            continue
         if isinstance(mod, BitLinear):
             apply_l2_optimal_row_prescale_(mod.weight)
-        elif isinstance(mod, BitLinearExperts):
+        else:
             apply_l2_optimal_row_prescale_(mod.gate_up_proj)
             apply_l2_optimal_row_prescale_(mod.down_proj)
+        mod.l2_prescaled = True
+
+
+def mark_model_l2_prescaled_(model: nn.Module, prescaled: bool = True) -> None:
+    """Record that loaded weights already carry (or do not carry) the L2-optimal row prescale."""
+    for mod in model.modules():
+        if isinstance(mod, (BitLinear, BitLinearExperts)):
+            mod.l2_prescaled = prescaled
+
+
+def set_model_ternary_l2_scale(model: nn.Module, enabled: bool) -> None:
+    """Make `quant_lambda == 1` use the explicit L2-optimal scale (for un-prescaled weights)."""
+    for mod in model.modules():
+        if isinstance(mod, (BitLinear, BitLinearExperts)):
+            mod.ternary_l2_scale = enabled
 
 
 def set_model_quant_lambda(model: nn.Module, quant_lambda: float) -> None:
@@ -137,6 +176,9 @@ def set_model_quant_lambda(model: nn.Module, quant_lambda: float) -> None:
 
 class BitLinear(nn.Module):
     """1.58-Bit Ternary Linear Projection with STE and optional `RMSNorm` Pre-Scaling."""
+
+    l2_prescaled: bool = False  # weights already carry the L2-optimal row prescale
+    ternary_l2_scale: bool = False  # see `set_model_ternary_l2_scale`
 
     def __init__(
         self,
@@ -190,6 +232,7 @@ class BitLinear(nn.Module):
             bit_linear.weight.copy_(linear.weight)
             if init_l2_scale:
                 apply_l2_optimal_row_prescale_(bit_linear.weight)
+                bit_linear.l2_prescaled = True
             if linear.bias is not None and bit_linear.bias is not None:
                 bit_linear.bias.copy_(linear.bias)
         return bit_linear
@@ -203,7 +246,7 @@ class BitLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_in = rms_prescale(x, eps=self.rms_eps) if self.use_rms_prescale else x
         x_q = _quantize_act_with_lambda(x_in, self.quant_lambda)
-        w_q = _quantize_weight_with_lambda(self.weight, self.quant_lambda)
+        w_q = _quantize_weight_with_lambda(self.weight, self.quant_lambda, self.ternary_l2_scale)
         return F.linear(x_q, w_q, self.bias)
 
     @torch.no_grad()
@@ -227,6 +270,9 @@ class BitLinearExperts(nn.Module):
     while applying per-channel ternary STE and per-token int8 activation STE on `gate`, `up`,
     and `down` projections cleanly.
     """
+
+    l2_prescaled: bool = False  # weights already carry the L2-optimal row prescale
+    ternary_l2_scale: bool = False  # see `set_model_ternary_l2_scale`
 
     def __init__(
         self,
@@ -296,6 +342,7 @@ class BitLinearExperts(nn.Module):
             if init_l2_scale:
                 apply_l2_optimal_row_prescale_(bit_experts.gate_up_proj)
                 apply_l2_optimal_row_prescale_(bit_experts.down_proj)
+                bit_experts.l2_prescaled = True
         if hasattr(experts_module, "act_fn"):
             bit_experts.act_fn = experts_module.act_fn
         return bit_experts
@@ -332,7 +379,9 @@ class BitLinearExperts(nn.Module):
         x_chunks = torch.split(x_sorted, active_counts, dim=0)
 
         # Quantize 3D expert banks once per layer instead of per active expert in Python loop
-        w_gu_all = _quantize_weight_with_lambda(self.gate_up_proj, self.quant_lambda)
+        w_gu_all = _quantize_weight_with_lambda(
+            self.gate_up_proj, self.quant_lambda, self.ternary_l2_scale
+        )
         w_gu_slices = torch.unbind(w_gu_all, dim=0)
         gu_out = torch.cat(
             [F.linear(xc, w_gu_slices[e]) for (e, _), xc in zip(active, x_chunks)],
@@ -345,7 +394,9 @@ class BitLinearExperts(nn.Module):
         mid_q = _quantize_act_with_lambda(mid_in, self.quant_lambda)
         mid_chunks = torch.split(mid_q, active_counts, dim=0)
 
-        w_dn_all = _quantize_weight_with_lambda(self.down_proj, self.quant_lambda)
+        w_dn_all = _quantize_weight_with_lambda(
+            self.down_proj, self.quant_lambda, self.ternary_l2_scale
+        )
         w_dn_slices = torch.unbind(w_dn_all, dim=0)
         dn_out = torch.cat(
             [F.linear(mc, w_dn_slices[e]) for (e, _), mc in zip(active, mid_chunks)],

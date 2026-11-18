@@ -53,6 +53,10 @@ struct CliArgs {
     #[arg(long, default_value = "1,42,17,99")]
     prompt_tokens: String,
 
+    /// Compute threads (`0` = one per available core).
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
     /// Number of new tokens to decode greedily.
     #[arg(long, default_value_t = 16)]
     max_new_tokens: usize,
@@ -94,6 +98,7 @@ fn resolve_paths(args: &CliArgs) -> Result<(PathBuf, PathBuf, Option<PathBuf>), 
 
 fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (core_path, experts_path, model_dir) = resolve_paths(&args)?;
+    terra_runtime::kernels::set_num_threads(args.threads);
     let config = EngineConfig {
         ram_budget_mb: args.ram_budget_mb,
         max_cached_experts: args.max_cached_experts,
@@ -145,13 +150,23 @@ fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             report.decode_tokens_per_sec
         );
         println!(
-            "Cache hit rate: {:.2}% (hits={}, prefetched={}, cold_misses={}, evictions={}, stall={} us)",
+            "Cache hit rate: {:.2}% (hits={}, same-token prefetched={}, stale prefetched={}, late={}, cold_misses={}, evictions={}, stall={} us)",
             report.cache_hit_rate_pct,
             report.prefetch_metrics.cache_hits,
             report.prefetch_metrics.prefetched_hits,
+            report.prefetch_metrics.stale_prefetch_hits,
+            report.prefetch_metrics.prefetch_late,
             report.prefetch_metrics.cold_misses,
             report.prefetch_metrics.evictions,
             report.prefetch_metrics.prefetch_stall_us
+        );
+        println!(
+            "Lookahead recall@k: {:.2}% | prefetch precision: {:.2}% | wasted prefetch: {:.1} MiB | peak RSS: {:.1} MiB | threads: {}",
+            report.lookahead_recall_at_k_pct,
+            report.prefetch_precision_pct,
+            report.prefetch_wasted_bytes as f64 / 1048576.0,
+            report.peak_rss_bytes as f64 / 1048576.0,
+            report.threads
         );
     }
 
