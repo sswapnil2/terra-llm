@@ -182,6 +182,39 @@ class GatedLinearRecurrenceAttention(nn.Module):
                 block.q_norm.weight.mul_(horizon_scale)
         return block
 
+    def enable_delta_rule(self, init_bias: float = -3.0) -> None:
+        """Switch the write rule to erase-then-write: `S = alpha * (I - beta * k^ k^T) S + k v^T`.
+
+        `beta = sigmoid(erase_proj(h))` per head; at `init_bias = -3` (`beta ~= 0.05`) the layer
+        starts within a few percent of the plain additive rule, so the warm start is preserved.
+        ponytail: Python training path only; exporter and Rust `state.rs` still implement the
+        additive rule, add the erase step there once this wins an ablation.
+        """
+        ref = self.decay_proj.weight
+        self.erase_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True).to(ref.device, torch.float32)
+        nn.init.zeros_(self.erase_proj.weight)
+        nn.init.constant_(self.erase_proj.bias, init_bias)
+
+    def enable_write_gate(self, init_bias: float = 4.0) -> None:
+        """Scale each token's write by a learned per-head importance `g = sigmoid(write_proj(h))`.
+
+        `S += g * k v^T`, so unimportant tokens barely touch the memory. `init_bias = 4`
+        (`g ~= 0.98`) keeps the warm start. ponytail: learned end to end; supervise it with the
+        teacher's received attention if it does not learn to discriminate on its own.
+        """
+        ref = self.decay_proj.weight
+        self.write_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True).to(ref.device, torch.float32)
+        nn.init.zeros_(self.write_proj.weight)
+        nn.init.constant_(self.write_proj.bias, init_bias)
+
+    def _erase_gate(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Per-token, per-head erase strength `beta` in `(0, 1)` (`[B, T, H]`), or None for the additive rule."""
+        if getattr(self, "erase_proj", None) is None:
+            return None
+        amp_off = torch.amp.autocast("cuda", enabled=False) if hidden_states.is_cuda else nullcontext()
+        with amp_off:
+            return torch.sigmoid(self.erase_proj(hidden_states.float()))
+
     def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
         """Expand `[B, T, H_kv, d]` -> `[B, T, H, d]` matching GQA head grouping."""
         if self.num_key_value_groups == 1:
@@ -209,6 +242,9 @@ class GatedLinearRecurrenceAttention(nn.Module):
         amp_off = torch.amp.autocast("cuda", enabled=False) if hidden_states.is_cuda else nullcontext()
         with amp_off:
             alpha = torch.sigmoid(self.decay_proj(hidden_states.float()))  # [B, T, H]
+            if getattr(self, "write_proj", None) is not None:
+                # Gating v is the same as gating the write k v^T; both forward paths pick it up here.
+                v = v * torch.sigmoid(self.write_proj(hidden_states.float())).unsqueeze(-1)
         return q, k, v, alpha
 
     def forward_parallel(
@@ -238,6 +274,10 @@ class GatedLinearRecurrenceAttention(nn.Module):
             k_h = k.permute(0, 2, 1, 3)
             v_h = v.permute(0, 2, 1, 3)
             log_alpha = torch.log(alpha.clamp(min=1e-7)).permute(0, 2, 1)  # [B, H, T] <= 0
+            beta = self._erase_gate(hidden_states)
+            if beta is not None:
+                khat_h = torch.nn.functional.normalize(k_h, dim=-1)
+                ab_h = (alpha.clamp(min=1e-7) * beta).permute(0, 2, 1)   # alpha_t * beta_t, [B, H, T]
 
             seg_ids = (
                 torch.cumsum(reset_mask.to(dtype=torch.int32), dim=-1)
@@ -290,6 +330,32 @@ class GatedLinearRecurrenceAttention(nn.Module):
                 qk_c = torch.matmul(q_c, k_c.transpose(-1, -2)) * decay_c   # [B, H, lc, lc]
                 out_intra = torch.matmul(qk_c, v_c)                         # [B, H, lc, d]
 
+                if beta is not None:
+                    # Delta rule: u_t = S_{t-1}^T k^_t is what the memory returns for key t before
+                    # the write. Within a chunk U solves the unit-lower-triangular system
+                    #   (I + A) U = g * (K^ S_0) + B V
+                    # A[t,i] = (gamma_{t-1}/gamma_i) alpha_i beta_i (k^_t . k^_i),  i < t
+                    # B[t,i] = (gamma_{t-1}/gamma_i) (k^_t . k_i),                  i < t
+                    kh_c = khat_h[:, :, start:end, :]
+                    ab_c = ab_h[:, :, start:end]
+                    cum_prev = cum_log - la_c                                # log gamma_{t-1}
+                    strict = attn_mask & ~torch.eye(lc, device=hidden_states.device, dtype=torch.bool)
+                    diff_p = cum_prev.unsqueeze(-1) - cum_log.unsqueeze(-2)
+                    decay_p = torch.where(strict, torch.exp(torch.where(strict, diff_p, torch.zeros_like(diff_p))), torch.zeros_like(diff_p))
+                    a_mat = torch.matmul(kh_c, kh_c.transpose(-1, -2)) * decay_p * ab_c.unsqueeze(-2)
+                    b_mat = torch.matmul(kh_c, k_c.transpose(-1, -2)) * decay_p
+                    u_prev = torch.matmul(kh_c, state) * torch.exp(cum_prev).unsqueeze(-1)
+                    if seg_c is not None and prev_seg is not None:
+                        u_prev = u_prev * same_prev
+                    eye = torch.eye(lc, device=hidden_states.device, dtype=torch.float32)
+                    u_c = torch.linalg.solve_triangular(
+                        eye + a_mat, u_prev + torch.matmul(b_mat, v_c), upper=False, unitriangular=True
+                    )                                                        # [B, H, lc, d]
+                    erased = u_c * ab_c.unsqueeze(-1)                        # alpha_i beta_i u_i
+                    out_intra = out_intra - torch.matmul(
+                        torch.matmul(q_c, kh_c.transpose(-1, -2)) * decay_c, erased
+                    )
+
                 chunk_outputs.append(out_inter + out_intra)
 
                 # 3. Advance exact recurrent state S_c to end of chunk
@@ -303,9 +369,13 @@ class GatedLinearRecurrenceAttention(nn.Module):
                     state = (chunk_total_decay * carry_prev) * state + torch.matmul(
                         (k_decayed * key_same).transpose(-1, -2), v_c
                     )
+                    if beta is not None:
+                        state = state - torch.matmul((kh_c * key_to_end_decay * key_same).transpose(-1, -2), erased)
                     prev_seg = last_seg
                 else:
                     state = chunk_total_decay * state + torch.matmul(k_decayed.transpose(-1, -2), v_c)
+                    if beta is not None:
+                        state = state - torch.matmul((kh_c * key_to_end_decay).transpose(-1, -2), erased)
 
             out_h = torch.cat(chunk_outputs, dim=2)  # [B, H, T, d]
         out_flat = out_h.permute(0, 2, 1, 3).reshape(bsz, seq_len, self.num_heads * self.head_dim)
@@ -337,6 +407,8 @@ class GatedLinearRecurrenceAttention(nn.Module):
         else:
             state = state.float().clone()
 
+        beta = self._erase_gate(hidden_states)
+        khat = torch.nn.functional.normalize(k, dim=-1) if beta is not None else None
         outputs = []
         for t in range(seq_len):
             alpha_t = alpha[:, t, :, None, None]  # [B, H, 1, 1]
@@ -344,6 +416,9 @@ class GatedLinearRecurrenceAttention(nn.Module):
             v_t = v[:, t, :, None, :]             # [B, H, 1, d]
             q_t = q[:, t, :, :, None]             # [B, H, d, 1]
 
+            if beta is not None and khat is not None:
+                kh_t = khat[:, t, :, :, None]     # [B, H, d, 1]
+                state = state - beta[:, t, :, None, None] * kh_t * torch.matmul(kh_t.transpose(-1, -2), state)
             state = alpha_t * state + (k_t * v_t)
             # o_{t, h} = S_t^T @ q_t = sum_i q_{t,i} * S_{t, i, :}
             o_t = torch.matmul(state.transpose(-1, -2), q_t).squeeze(-1)  # [B, H, d]

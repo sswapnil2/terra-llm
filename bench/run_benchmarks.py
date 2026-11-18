@@ -5,7 +5,7 @@ Executes `terra-cli` locally (macOS ARM NEON + `F_NOCACHE`) and on Colab Linux
 Compares:
   1. Demand-only cold NVMe reads (`--no-lookahead`) under `--ram-budget-mb 2048`
   2. 3-Layer Lookahead async prefetching under `--ram-budget-mb 2048`
-  3. Optional 16k-context budget compliance & tighter-RAM stress benchmarks
+  3. Optional 16k KV-reservation budget check under a tighter RAM budget
 """
 
 from __future__ import annotations
@@ -57,20 +57,31 @@ def _run_terra_cli(
         raise AssertionError(
             f"RAM budget exceeded: {resident_bytes} B > {budget_bytes} B ({ram_budget_mb} MB)"
         )
+    # The engine's own accounting excludes per-token scratch, thread stacks and allocator
+    # overhead, so also hold the OS-reported peak RSS to the budget. (On macOS memory compression
+    # can make this under-read; a cgroup/ulimit-enforced run on Linux is still the real test.)
+    peak_rss = int(report.get("peak_rss_bytes", 0))
+    if peak_rss > budget_bytes:
+        raise AssertionError(
+            f"OS-reported peak RSS exceeded the budget: {peak_rss} B > {budget_bytes} B"
+        )
     return report
 
 
 def format_markdown_table(runs: list[tuple[str, dict[str, Any]]]) -> str:
     lines = [
-        "| Mode | SIMD | IO Backend | Direct I/O | Resident MB | Cached Experts | Hit Rate % | TTFT (ms) | Decode (tok/s) | Stall (us) |",
-        "| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| Mode | SIMD | Threads | IO Backend | Direct I/O | Accounted MB | Peak RSS MB | Cached Experts | Cache Hit % | Lookahead Recall@k % | Prefetch Precision % | Wasted Prefetch MB | TTFT (ms) | Decode (tok/s) | Stall (us) |",
+        "| :--- | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
     for label, r in runs:
         res_mb = r["memory"]["total_resident_bytes"] / (1024 * 1024)
         pm = r["prefetch_metrics"]
         lines.append(
-            f"| {label} | {r['simd_backend']} | {r['io_backend']} | {r['direct_io_active']} | "
-            f"{res_mb:.1f} | {r['memory']['max_cached_experts']} | {r['cache_hit_rate_pct']:.2f}% | "
+            f"| {label} | {r['simd_backend']} | {r.get('threads', 1)} | {r['io_backend']} | "
+            f"{r['direct_io_active']} | {res_mb:.1f} | {r.get('peak_rss_bytes', 0) / (1024 * 1024):.1f} | "
+            f"{r['memory']['max_cached_experts']} | {r['cache_hit_rate_pct']:.2f}% | "
+            f"{r.get('lookahead_recall_at_k_pct', 0.0):.2f}% | {r.get('prefetch_precision_pct', 0.0):.2f}% | "
+            f"{r.get('prefetch_wasted_bytes', 0) / (1024 * 1024):.1f} | "
             f"{r['ttft_ms']:.2f} | {r['decode_tokens_per_sec']:.2f} | {pm['prefetch_stall_us']} |"
         )
     return "\n".join(lines)
@@ -84,13 +95,15 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--terra-cli", type=Path, default=default_cli)
     parser.add_argument("--ram-budget-mb", type=int, default=2048)
-    parser.add_argument("--max-seq-len", type=int, default=16384)
+    # 0 = the model's own position range. A larger request is clamped (with a warning) by the engine.
+    parser.add_argument("--max-seq-len", type=int, default=0)
     parser.add_argument(
         "--prompt-tokens",
         type=str,
         default="1,42,17,99,128,256,512,1024,2048,4096,8192,16384",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=12)
+    # Long enough to leave cold start: the first ~30 tokens mostly measure expert loading.
+    parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--generate-synthetic", action="store_true")
     parser.add_argument("--run-16k-check", action="store_true")
     parser.add_argument("--out-json", type=Path, default=None)
@@ -142,7 +155,8 @@ def main() -> int:
             max_new_tokens=6,
             no_lookahead=False,
         )
-        runs.append(("Tight 16k Stream (--ram-budget-mb 1024)", tight_rep))
+        # 6 tokens: this checks that a 16k KV reservation fits the budget, NOT 16k-token inference.
+        runs.append(("16k KV reservation only (--ram-budget-mb 1024, 6 tokens)", tight_rep))
 
     table = format_markdown_table(runs)
     print(table)

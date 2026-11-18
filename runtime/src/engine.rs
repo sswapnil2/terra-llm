@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::{CoreFile, CoreHeader, ExpertsDirectory, FormatError, LayerKind, TensorDtype};
 use crate::kernels::ternary_simd::{
-    active_simd_backend, ternary_gemv, ternary_gemv_prequantized, QuantizedActivation,
+    active_simd_backend, ternary_gemv, ternary_gemv_prequantized, ternary_gemv_prequantized_par,
+    QuantizedActivation,
 };
 use crate::kernels::{
-    f16_gemv, f32_gemv, rms_norm, rms_norm_in_place, sigmoid, silu, softmax_in_place,
-    top_k_with_ties,
+    f16_gemv, f32_gemv, num_threads, par_each_mut, rms_norm, rms_norm_in_place, sigmoid, silu,
+    softmax_in_place, top_k_with_ties,
 };
 use crate::nvme_pool::{ExpertLruPool, PoolSizingConfig, PrefetchMetrics};
 use crate::state::HybridStateManager;
@@ -93,16 +94,8 @@ impl LinearHandle {
         match self.dtype {
             TensorDtype::Ternary2Bit => {
                 let tv = core.ternary_by_index(self.entry_idx);
-                ternary_gemv(
-                    tv.packed,
-                    &tv.scales,
-                    x,
-                    self.rows,
-                    self.cols,
-                    rms_prescale,
-                    rms_eps,
-                    out,
-                );
+                let qx = QuantizedActivation::quantize(x, rms_prescale, rms_eps);
+                ternary_gemv_prequantized_par(tv.packed, &tv.scales, &qx, self.rows, self.cols, out);
             }
             TensorDtype::F32 => {
                 let w = core.f32_by_index(self.entry_idx);
@@ -128,7 +121,7 @@ impl LinearHandle {
         if self.dtype == TensorDtype::Ternary2Bit {
             if let Some(q) = qx {
                 let tv = core.ternary_by_index(self.entry_idx);
-                ternary_gemv_prequantized(tv.packed, &tv.scales, q, self.rows, self.cols, out);
+                ternary_gemv_prequantized_par(tv.packed, &tv.scales, q, self.rows, self.cols, out);
                 return;
             }
         }
@@ -191,7 +184,42 @@ pub struct BenchmarkReport {
     pub decode_tokens_per_sec: f64,
     pub memory: MemoryBreakdown,
     pub prefetch_metrics: PrefetchMetrics,
+    /// Share of expert acquisitions that found the expert resident, whatever put it there.
     pub cache_hit_rate_pct: f64,
+    /// Lookahead top-k predictions that were in the target layer's true top-k (cache-independent).
+    /// Chance level is `top_k / num_experts`.
+    #[serde(default)]
+    pub lookahead_recall_at_k_pct: f64,
+    /// Prefetch requests used at their target layer in the same token.
+    #[serde(default)]
+    pub prefetch_precision_pct: f64,
+    #[serde(default)]
+    pub prefetch_wasted_bytes: u64,
+    /// OS-reported peak resident set size of this process (`getrusage`), not self-accounting.
+    #[serde(default)]
+    pub peak_rss_bytes: u64,
+    #[serde(default)]
+    pub threads: usize,
+    /// Context actually reserved; smaller than requested when clamped to the model's position range.
+    #[serde(default)]
+    pub kv_reserved_tokens: usize,
+}
+
+/// OS-reported peak RSS of this process in bytes.
+pub fn peak_rss_bytes() -> u64 {
+    // SAFETY: `getrusage` only writes into the zero-initialised struct we pass.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return 0;
+    }
+    // macOS reports bytes, Linux kilobytes.
+    (ru.ru_maxrss as u64) * if cfg!(target_os = "macos") { 1 } else { 1024 }
+}
+
+struct ExpertScratch {
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
 }
 
 pub struct TerraEngine {
@@ -205,6 +233,10 @@ pub struct TerraEngine {
     state: HybridStateManager,
     nvme_pool: ExpertLruPool,
     config: EngineConfig,
+    /// This token's lookahead predictions, indexed by target layer.
+    look_pred: Vec<Vec<usize>>,
+    lookahead_correct: u64,
+    lookahead_total: u64,
 }
 
 impl TerraEngine {
@@ -392,6 +424,13 @@ impl TerraEngine {
         let reserve_tokens = if config.kv_reserve_tokens == 0 {
             max_model_pos
         } else {
+            if config.kv_reserve_tokens > max_model_pos {
+                eprintln!(
+                    "terra-runtime: WARNING: requested context {} exceeds the model's \
+                     max_position_embeddings; clamping to {max_model_pos} tokens.",
+                    config.kv_reserve_tokens
+                );
+            }
             config.kv_reserve_tokens.min(max_model_pos)
         };
         let state = HybridStateManager::new(
@@ -422,6 +461,9 @@ impl TerraEngine {
             state,
             nvme_pool,
             config,
+            look_pred: vec![Vec::new(); num_layers],
+            lookahead_correct: 0,
+            lookahead_total: 0,
         })
     }
 
@@ -460,6 +502,8 @@ impl TerraEngine {
     pub fn reset_state(&mut self) {
         self.state.reset();
         self.nvme_pool.reset_metrics();
+        self.lookahead_correct = 0;
+        self.lookahead_total = 0;
     }
 
     pub fn memory_breakdown(&self) -> MemoryBreakdown {
@@ -518,6 +562,11 @@ impl TerraEngine {
         let rms_prescale = self.core.header.has_rms_prescale();
         let norm_topk = self.core.header.norm_topk_prob();
 
+        self.nvme_pool.begin_token();
+        for p in &mut self.look_pred {
+            p.clear();
+        }
+
         // 1. Token Embedding (+ optional Section 2.3 HintEmbedding)
         let mut h = vec![0.0f32; d];
         match self.embed_dtype {
@@ -567,10 +616,13 @@ impl TerraEngine {
         let mut look_logits = vec![0.0f32; num_experts];
         let mut m_t = vec![0.0f32; d];
         let mut router_probs = vec![0.0f32; num_experts];
-        let mut gate_buf = vec![0.0f32; inter];
-        let mut up_buf = vec![0.0f32; inter];
-        let mut swiglu_buf = vec![0.0f32; inter];
-        let mut down_buf = vec![0.0f32; d];
+        let mut expert_scratch: Vec<ExpertScratch> = (0..top_k)
+            .map(|_| ExpertScratch {
+                gate: vec![0.0f32; inter],
+                up: vec![0.0f32; inter],
+                down: vec![0.0f32; d],
+            })
+            .collect();
         let mut moe_accum = vec![0.0f32; d];
 
         let mut layer0_post_moe = None;
@@ -665,6 +717,7 @@ impl TerraEngine {
                         let _ = self
                             .nvme_pool
                             .prefetch_layer_experts(l + lookahead_offset, &pred_ids);
+                        self.look_pred[l + lookahead_offset] = pred_ids;
                     }
                 }
 
@@ -690,6 +743,13 @@ impl TerraEngine {
                 }
 
                 let active_ids: Vec<usize> = topk.iter().map(|&(eid, _)| eid).collect();
+                if !self.look_pred[l].is_empty() {
+                    self.lookahead_total += active_ids.len() as u64;
+                    self.lookahead_correct += active_ids
+                        .iter()
+                        .filter(|e| self.look_pred[l].contains(e))
+                        .count() as u64;
+                }
                 self.nvme_pool.acquire_layer_experts(l, &active_ids)?;
 
                 // Pre-quantize `m_t` ONCE and reuse across all `top_k` experts' `gate_proj` and `up_proj`!
@@ -697,15 +757,20 @@ impl TerraEngine {
                 moe_accum.fill(0.0);
 
                 let expert_res: Result<(), RuntimeError> = (|| {
-                    for &(expert_id, weight_p) in &topk {
-                        let view = self.nvme_pool.expert_view(l, expert_id)?;
+                    let views = topk
+                        .iter()
+                        .map(|&(expert_id, _)| self.nvme_pool.expert_view(l, expert_id))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // The top-k experts are independent: one thread each, private scratch.
+                    par_each_mut(&mut expert_scratch[..views.len()], |i, s| {
+                        let view = &views[i];
                         ternary_gemv_prequantized(
                             view.gate_packed,
                             view.gate_scales,
                             &m_qx,
                             inter,
                             d,
-                            &mut gate_buf,
+                            &mut s.gate,
                         );
                         ternary_gemv_prequantized(
                             view.up_packed,
@@ -713,23 +778,26 @@ impl TerraEngine {
                             &m_qx,
                             inter,
                             d,
-                            &mut up_buf,
+                            &mut s.up,
                         );
                         for j in 0..inter {
-                            swiglu_buf[j] = silu(gate_buf[j]) * up_buf[j];
+                            s.gate[j] = silu(s.gate[j]) * s.up[j];
                         }
                         ternary_gemv(
                             view.down_packed,
                             view.down_scales,
-                            &swiglu_buf,
+                            &s.gate,
                             d,
                             inter,
                             rms_prescale,
                             eps,
-                            &mut down_buf,
+                            &mut s.down,
                         );
+                    });
+                    // Sum in router order so the result does not depend on thread scheduling.
+                    for (s, &(_, weight_p)) in expert_scratch.iter().zip(&topk) {
                         for i in 0..d {
-                            moe_accum[i] += weight_p * down_buf[i];
+                            moe_accum[i] += weight_p * s.down[i];
                         }
                     }
                     Ok(())
@@ -831,6 +899,13 @@ impl TerraEngine {
             decode_ms,
             decode_tokens_per_sec,
             memory: self.memory_breakdown(),
+            lookahead_recall_at_k_pct: 100.0 * (self.lookahead_correct as f64)
+                / (self.lookahead_total.max(1) as f64),
+            prefetch_precision_pct: metrics.prefetch_precision() * 100.0,
+            prefetch_wasted_bytes: metrics.prefetch_wasted_bytes(),
+            peak_rss_bytes: peak_rss_bytes(),
+            threads: num_threads(),
+            kv_reserved_tokens: self.state.max_kv_tokens(),
             prefetch_metrics: metrics,
             cache_hit_rate_pct: hit_rate_pct,
         })

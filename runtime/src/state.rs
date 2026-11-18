@@ -6,7 +6,7 @@
 //!   exclusively for those anchor layers.
 
 use crate::format::LayerKind;
-use crate::kernels::softmax_in_place;
+use crate::kernels::{dot_f32, f16_bits_to_f32, par_each_mut, softmax_in_place};
 use half::f16;
 
 #[derive(Debug, Clone)]
@@ -111,7 +111,6 @@ pub struct HybridStateManager {
     max_kv_tokens: usize,
     rope_inv_freq: Vec<f32>,
     layers: Vec<LayerState>,
-    scores_scratch: Vec<f32>,
     seq_len: usize,
 }
 
@@ -146,8 +145,6 @@ impl HybridStateManager {
             })
             .collect();
 
-        let mut scores_scratch = Vec::new();
-        scores_scratch.reserve_exact(max_kv_tokens);
 
         Self {
             num_heads,
@@ -156,7 +153,6 @@ impl HybridStateManager {
             max_kv_tokens,
             rope_inv_freq,
             layers,
-            scores_scratch,
             seq_len: 0,
         }
     }
@@ -242,7 +238,7 @@ impl HybridStateManager {
     pub fn memory_bytes(&self) -> usize {
         self.recurrent_allocated_bytes()
             + self.anchor_kv_capacity_bytes()
-            + (self.rope_inv_freq.capacity() + self.scores_scratch.capacity())
+            + self.rope_inv_freq.capacity()
                 * std::mem::size_of::<f32>()
     }
 
@@ -389,41 +385,43 @@ impl HybridStateManager {
         kv.seq_len = pos + 1;
 
         let total_t = kv.seq_len;
-        if self.scores_scratch.len() < total_t {
-            self.scores_scratch.resize(total_t, 0.0);
-        }
-        let scores = &mut self.scores_scratch[..total_t];
-
+        let kv: &AnchorKvCache = kv;
+        let q_flat: &[f32] = q_flat;
         let kv_stride = h_kv_count * d;
         let group_size = h_count / h_kv_count;
-        let scale = 1.0f64 / (d as f64).sqrt();
+        let scale = 1.0f32 / (d as f32).sqrt();
 
-        for h in 0..h_count {
+        // One head: softmax(q . K / sqrt(d)) . V over the whole cache. f16 rows are decoded exactly
+        // to f32 and accumulated in f32 (see `test_anchor_attention_matches_f64_reference`).
+        let head = |h: usize, out_h: &mut [f32]| {
             let h_kv = h / group_size;
             let q_h = &q_flat[h * d..(h + 1) * d];
-
-            for tau in 0..total_t {
-                let k_off = tau * kv_stride + h_kv * d;
-                let k_tau = &kv.k_cache[k_off..k_off + d];
-                let mut dot = 0.0f64;
-                for j in 0..d {
-                    dot += (q_h[j] as f64) * (f16::from_bits(k_tau[j]).to_f32() as f64);
-                }
-                scores[tau] = (dot * scale) as f32;
+            let mut row = vec![0.0f32; d];
+            let mut scores = vec![0.0f32; total_t];
+            for (tau, s) in scores.iter_mut().enumerate() {
+                let off = tau * kv_stride + h_kv * d;
+                f16_bits_to_f32(&kv.k_cache[off..off + d], &mut row);
+                *s = dot_f32(q_h, &row) * scale;
             }
-
-            softmax_in_place(scores);
-
-            let out_h = &mut out_attn[h * d..(h + 1) * d];
+            softmax_in_place(&mut scores);
             out_h.fill(0.0);
-            for tau in 0..total_t {
-                let p = scores[tau];
-                let v_off = tau * kv_stride + h_kv * d;
-                let v_tau = &kv.v_cache[v_off..v_off + d];
+            for (tau, &p) in scores.iter().enumerate() {
+                let off = tau * kv_stride + h_kv * d;
+                f16_bits_to_f32(&kv.v_cache[off..off + d], &mut row);
                 for j in 0..d {
-                    out_h[j] += p * f16::from_bits(v_tau[j]).to_f32();
+                    out_h[j] += p * row[j];
                 }
             }
+        };
+
+        let mut heads: Vec<&mut [f32]> = out_attn.chunks_mut(d).collect();
+        if total_t * d < (1 << 15) {
+            // Short context: thread spawns would cost more than the attention itself.
+            for (h, out_h) in heads.iter_mut().enumerate() {
+                head(h, out_h);
+            }
+        } else {
+            par_each_mut(&mut heads, |h, out_h| head(h, out_h));
         }
     }
 
@@ -490,6 +488,86 @@ impl HybridStateManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_anchor_attention_matches_f64_reference() {
+        // 300 tokens x head_dim 128 crosses the threaded path; grouped KV heads (4 -> 2) exercise GQA.
+        let (h, h_kv, d, steps) = (4usize, 2usize, 128usize, 300usize);
+        let mut mgr = HybridStateManager::new(&[LayerKind::AnchorGqa], h, h_kv, d, 10000.0, steps);
+        let val = |t: usize, i: usize, f: f32| (((t * 131 + i * 7) as f32) * f).sin();
+        let mut k_hist: Vec<Vec<f64>> = Vec::new();
+        let mut v_hist: Vec<Vec<f64>> = Vec::new();
+        let mut max_diff = 0.0f64;
+        for t in 0..steps {
+            let mut q: Vec<f32> = (0..h * d).map(|i| val(t, i, 0.013) * 4.0).collect();
+            let mut k: Vec<f32> = (0..h_kv * d).map(|i| val(t, i, 0.029) * 4.0).collect();
+            let v: Vec<f32> = (0..h_kv * d).map(|i| val(t, i, 0.041)).collect();
+            let mut out = vec![0.0f32; h * d];
+            mgr.step_anchor_gqa(0, &mut q, &mut k, &v, &mut out);
+            mgr.commit_token();
+            // `q` and `k` now hold the RoPE-rotated vectors; the cache stores K/V rounded to f16.
+            let to_f16 = |x: &[f32]| x.iter().map(|&a| f16::from_f32(a).to_f64()).collect::<Vec<_>>();
+            k_hist.push(to_f16(&k));
+            v_hist.push(to_f16(&v));
+
+            for head in 0..h {
+                let kvh = head / (h / h_kv);
+                let scores: Vec<f64> = k_hist
+                    .iter()
+                    .map(|kt| {
+                        (0..d).map(|j| q[head * d + j] as f64 * kt[kvh * d + j]).sum::<f64>()
+                            / (d as f64).sqrt()
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let z: f64 = scores.iter().map(|s| (s - m).exp()).sum();
+                for j in 0..d {
+                    let want: f64 = scores
+                        .iter()
+                        .zip(&v_hist)
+                        .map(|(s, vt)| (s - m).exp() / z * vt[kvh * d + j])
+                        .sum();
+                    max_diff = max_diff.max((want - out[head * d + j] as f64).abs());
+                }
+            }
+        }
+        // Outputs are convex combinations of |v| <= 1; f32 accumulation stays ~1e-6 from f64.
+        assert!(max_diff < 2e-5, "anchor attention deviates from f64 reference by {max_diff:e}");
+    }
+
+    /// Anchor-layer cost at real OLMoE shapes (16 heads x 128) versus context length. Run with:
+    /// `cargo test --release bench_anchor_attention -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn bench_anchor_attention() {
+        let (h, d, steps) = (16usize, 128usize, 4096usize);
+        for threads in [1usize, 0] {
+            crate::kernels::set_num_threads(threads);
+            let mut mgr = HybridStateManager::new(&[LayerKind::AnchorGqa], h, h, d, 10000.0, steps);
+            let mut out = vec![0.0f32; h * d];
+            let mut window = std::time::Instant::now();
+            for t in 0..steps {
+                let mut q: Vec<f32> = (0..h * d).map(|i| ((t * 131 + i) as f32 * 0.013).sin()).collect();
+                let mut k = q.clone();
+                let v = q.clone();
+                mgr.step_anchor_gqa(0, &mut q, &mut k, &v, &mut out);
+                mgr.commit_token();
+                // Mean over the 64 steps ending at each reported context length.
+                if [447usize, 959, 1983, 4031].contains(&t) {
+                    window = std::time::Instant::now();
+                }
+                if [511usize, 1023, 2047, 4095].contains(&t) {
+                    println!(
+                        "anchor layer, threads={}, context {}: {:.3} ms/token",
+                        crate::kernels::num_threads(),
+                        t + 1,
+                        window.elapsed().as_secs_f64() * 1000.0 / 64.0
+                    );
+                }
+            }
+        }
+        crate::kernels::set_num_threads(0);
+    }
 
     #[test]
     fn test_recurrent_state_strictly_o1_over_2048_tokens_and_anchor_only_kv() {

@@ -1,0 +1,235 @@
+{
+ "meta": {
+  "ctx": 4096,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "started": "2026-11-18 05:23:19",
+  "finished": "2026-11-18 05:36:42"
+ },
+ "G_olmoe": {
+  "bf16": {
+   "wikitext103_test": {
+    "bits_per_byte": 0.5883722537515302,
+    "nats_per_token": 1.8372154797607718,
+    "tokens": 285512,
+    "window_nats_median": 1.9444855040378946,
+    "window_nats_max": 3.0857230904288597
+   },
+   "fineweb_edu": {
+    "bits_per_byte": 0.6533032334457292,
+    "nats_per_token": 2.0639954013082082,
+    "tokens": 226335,
+    "window_nats_median": 2.1474843272626507,
+    "window_nats_max": 3.1539907003998473
+   }
+  },
+  "int4_experts_only": {
+   "wikitext103_test": {
+    "bits_per_byte": 0.5983341469417163,
+    "nats_per_token": 1.8683218826545802,
+    "tokens": 285512,
+    "window_nats_median": 1.9719348604063036,
+    "window_nats_max": 3.1278680345792345
+   },
+   "fineweb_edu": {
+    "bits_per_byte": 0.6621929335096118,
+    "nats_per_token": 2.092080827970018,
+    "tokens": 226335,
+    "window_nats_median": 2.1605136186878617,
+    "window_nats_max": 3.166140719917739
+   }
+  },
+  "int4_all_linear": {
+   "wikitext103_test": {
+    "bits_per_byte": 0.606259593782116,
+    "nats_per_token": 1.8930694018082495,
+    "tokens": 285512,
+    "window_nats_median": 1.9873661760591583,
+    "window_nats_max": 3.140018366777975
+   },
+   "fineweb_edu": {
+    "bits_per_byte": 0.6686905508698083,
+    "nats_per_token": 2.1126088946691097,
+    "tokens": 226335,
+    "window_nats_median": 2.1614842503480634,
+    "window_nats_max": 3.177212192512427
+   }
+  }
+ },
+ "H_cache_sim": {
+  "int4_block32": {
+   "expert_mib": 3.375,
+   "sim": {
+    "scored_tokens": 120000,
+    "accesses_per_token": 128,
+    "note": "cold start at the beginning of the scored segment",
+    "slots_439": {
+     "lru": {
+      "miss_rate": 0.3173741536458333,
+      "mib_read_per_token": 137.105634375
+     },
+     "pin_top_half_plus_lru": {
+      "miss_rate": 0.32348294270833333,
+      "mib_read_per_token": 139.74463125
+     },
+     "static_pin_only": {
+      "miss_rate": 0.3886029296875,
+      "mib_read_per_token": 167.876465625
+     },
+     "belady_optimal": {
+      "miss_rate": 0.13135286458333334,
+      "mib_read_per_token": 56.7444375
+     }
+    },
+    "slots_743": {
+     "lru": {
+      "miss_rate": 0.08123463541666667,
+      "mib_read_per_token": 35.0933625
+     },
+     "pin_top_half_plus_lru": {
+      "miss_rate": 0.08937389322916667,
+      "mib_read_per_token": 38.609521875
+     },
+     "static_pin_only": {
+      "miss_rate": 0.131743359375,
+      "mib_read_per_token": 56.91313125
+     },
+     "belady_optimal": {
+      "miss_rate": 0.0245306640625,
+      "mib_read_per_token": 10.597246875
+     }
+    }
+   }
+  },
+  "int3_block32": {
+   "expert_mib": 2.625,
+   "sim": {
+    "scored_tokens": 120000,
+    "accesses_per_token": 128,
+    "note": "cold start at the beginning of the scored segment",
+    "slots_565": {
+     "lru": {
+      "miss_rate": 0.20730735677083334,
+      "mib_read_per_token": 69.655271875
+     },
+     "pin_top_half_plus_lru": {
+      "miss_rate": 0.2139455078125,
+      "mib_read_per_token": 71.885690625
+     },
+     "static_pin_only": {
+      "miss_rate": 0.27058248697916665,
+      "mib_read_per_token": 90.915715625
+     },
+     "belady_optimal": {
+      "miss_rate": 0.0742564453125,
+      "mib_read_per_token": 24.950165625
+     }
+    },
+    "slots_955": {
+     "lru": {
+      "miss_rate": 0.0034500651041666666,
+      "mib_read_per_token": 1.159221875
+     },
+     "pin_top_half_plus_lru": {
+      "miss_rate": 0.003921549479166666,
+      "mib_read_per_token": 1.317640625
+     },
+     "static_pin_only": {
+      "miss_rate": 0.01661796875,
+      "mib_read_per_token": 5.5836375
+     },
+     "belady_optimal": {
+      "miss_rate": 0.0010921223958333334,
+      "mib_read_per_token": 0.366953125
+     }
+    }
+   }
+  }
+ },
+ "F_teachers": {
+  "Qwen/Qwen2.5-3B:float32": {
+   "params": 3085938688,
+   "wikitext103_test": {
+    "bits_per_byte": 0.8057551009093369,
+    "nats_per_token": 2.4055694778741246,
+    "tokens": 298619,
+    "window_nats_median": 2.460603902214366,
+    "window_nats_max": 4.340304802992465
+   },
+   "fineweb_edu": {
+    "bits_per_byte": 0.7189597207013929,
+    "nats_per_token": 2.2387640821333714,
+    "tokens": 229637,
+    "window_nats_median": 2.2155044210405315,
+    "window_nats_max": 3.9988699223597846
+   }
+  },
+  "Qwen/Qwen2.5-7B:bfloat16": {
+   "params": 7615616512,
+   "wikitext103_test": {
+    "bits_per_byte": 0.6174425942209095,
+    "nats_per_token": 1.8433653815172855,
+    "tokens": 298619,
+    "window_nats_median": 1.8768469231782616,
+    "window_nats_max": 3.3735255521067855
+   },
+   "fineweb_edu": {
+    "bits_per_byte": 0.646421110887187,
+    "nats_per_token": 2.0128865683534585,
+    "tokens": 229637,
+    "window_nats_median": 2.0428604084181914,
+    "window_nats_max": 3.1073493531963323
+   }
+  },
+  "microsoft/phi-4:bfloat16": {
+   "params": 14659507200,
+   "wikitext103_test": {
+    "bits_per_byte": 0.5787298040661966,
+    "nats_per_token": 1.7862604236427202,
+    "tokens": 288844,
+    "window_nats_median": 1.7942238535706305,
+    "window_nats_max": 3.5000907248418245
+   },
+   "fineweb_edu": {
+    "bits_per_byte": 0.6413733484690302,
+    "nats_per_token": 2.053560650857711,
+    "tokens": 223331,
+    "window_nats_median": 2.049469646946476,
+    "window_nats_max": 3.097826141556603
+   }
+  },
+  "Qwen/Qwen2.5-14B:bfloat16": {
+   "params": 14770033664,
+   "wikitext103_test": {
+    "bits_per_byte": 0.5293920811895862,
+    "nats_per_token": 1.5804919272626756,
+    "tokens": 298619,
+    "window_nats_median": 1.6630444324749087,
+    "window_nats_max": 3.376615381174827
+   },
+   "fineweb_edu": {
+    "bits_per_byte": 0.5743765446030877,
+    "nats_per_token": 1.788547453566376,
+    "tokens": 229637,
+    "window_nats_median": 1.8995523633260478,
+    "window_nats_max": 2.9473455665351933
+   }
+  },
+  "Qwen/Qwen2.5-32B:bfloat16": {
+   "params": 32763876352,
+   "wikitext103_test": {
+    "bits_per_byte": 0.5098838458228387,
+    "nats_per_token": 1.522250390209455,
+    "tokens": 298619,
+    "window_nats_median": 1.6161815369798727,
+    "window_nats_max": 3.1866053387793842
+   },
+   "fineweb_edu": {
+    "bits_per_byte": 0.5498771727075565,
+    "nats_per_token": 1.7122590159039226,
+    "tokens": 229637,
+    "window_nats_median": 1.8230582767636785,
+    "window_nats_max": 2.9010941997276722
+   }
+  }
+ }
+}

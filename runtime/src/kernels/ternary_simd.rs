@@ -732,6 +732,42 @@ pub fn ternary_gemv_prequantized(
     ternary_gemv_scalar_prequantized(packed, weight_scales, qx, rows, cols, out);
 }
 
+/// Row-partitioned [`ternary_gemv_prequantized`] for large matrices. Rows are independent, so the
+/// output is bit-identical to the single-threaded kernel for any thread count.
+pub fn ternary_gemv_prequantized_par(
+    packed: &[u8],
+    weight_scales: &[f32],
+    qx: &QuantizedActivation,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    let threads = crate::kernels::num_threads();
+    // Below ~4M weights (0.4 ms of work) the thread spawns cost more than they save.
+    if threads <= 1 || rows * cols < (1 << 22) {
+        ternary_gemv_prequantized(packed, weight_scales, qx, rows, cols, out);
+        return;
+    }
+    assert_eq!(packed.len(), rows * cols / 4);
+    assert_eq!(weight_scales.len(), rows);
+    assert_eq!(out.len(), rows);
+    let bytes_per_row = cols / 4;
+    let rows_per = rows.div_ceil(threads);
+    let mut blocks: Vec<&mut [f32]> = out.chunks_mut(rows_per).collect();
+    crate::kernels::par_each_mut(&mut blocks, |b, block| {
+        let r0 = b * rows_per;
+        let n = block.len();
+        ternary_gemv_prequantized(
+            &packed[r0 * bytes_per_row..(r0 + n) * bytes_per_row],
+            &weight_scales[r0..r0 + n],
+            qx,
+            n,
+            cols,
+            block,
+        );
+    });
+}
+
 /// Hardware-dispatched ternary GEMV (`[rows, cols] x [cols] -> [rows]`).
 #[inline]
 pub fn ternary_gemv(
@@ -764,6 +800,30 @@ mod tests {
                 (u * 2.0 - 1.0) * scale
             })
             .collect()
+    }
+
+    #[test]
+    fn test_row_partitioned_kernel_bit_identical_to_serial() {
+        // 2048 x 2048 crosses the threading threshold; 2047 rows leaves a ragged last block.
+        for &rows in &[2048usize, 2047] {
+            let cols = 2048;
+            let w = det_vec(rows * cols, 11, 0.02);
+            let (packed, scales) = quantize_pack_ternary_absmean(&w, rows, cols).unwrap();
+            let x = det_vec(cols, 12, 1.5);
+            let qx = QuantizedActivation::quantize(&x, false, 1e-5);
+            let mut want = vec![0.0f32; rows];
+            ternary_gemv_prequantized(&packed, &scales, &qx, rows, cols, &mut want);
+            for threads in [1usize, 3, 10] {
+                crate::kernels::set_num_threads(threads);
+                let mut got = vec![0.0f32; rows];
+                ternary_gemv_prequantized_par(&packed, &scales, &qx, rows, cols, &mut got);
+                assert!(
+                    got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "rows={rows} threads={threads}"
+                );
+            }
+            crate::kernels::set_num_threads(0);
+        }
     }
 
     #[test]

@@ -44,6 +44,8 @@ from train.bitlinear import (
     BitLinear,
     BitLinearExperts,
     apply_l2_optimal_model_prescale_,
+    mark_model_l2_prescaled_,
+    set_model_ternary_l2_scale,
     set_model_quant_lambda,
 )
 from train.distill import (
@@ -57,8 +59,12 @@ from train.hybrid_ssm import (
     GatedLinearRecurrenceAttention,
     MicroTerraHybridWrapper,
     build_document_causal_mask,
+    default_anchor_layers,
 )
 from train.lookahead_router import LookaheadRouterBank
+
+# Documents [0, EVAL_RESERVED_DOCS) of each corpus stream are validation-only; training starts after.
+EVAL_RESERVED_DOCS = 2048
 
 
 def stochastic_round_bf16(x_f32: torch.Tensor) -> torch.Tensor:
@@ -159,7 +165,11 @@ class StochasticBF16AdamW(torch.optim.Optimizer):
 
                     g_f32 = g_sl.float()
                     m_f32 = mq_sl.float() * ms_sl
-                    v_sqrt_f32 = vq_sl.float() * vs_sl
+                    # Code 0 means "somewhere in [0, half a step)", not "exactly zero". Decoding it as
+                    # zero lets a non-zero momentum be divided by `eps` alone on a step with no gradient
+                    # (an expert that was not routed), a ~200x oversized update. Use the top of the
+                    # interval instead, which keeps the update within 8-bit rounding of exact Adam's.
+                    v_sqrt_f32 = vq_sl.float().clamp_min_(0.5) * vs_sl
 
                     m_f32.mul_(beta1).add_(g_f32, alpha=1.0 - beta1)
                     v_f32 = (v_sqrt_f32 * v_sqrt_f32).mul_(beta2).addcmul_(g_f32, g_f32, value=1.0 - beta2)
@@ -428,6 +438,13 @@ def configure_training_stage(
     return 2, q_lam, l2_prescaled
 
 
+def anchor_layers_from_checkpoint(ckpt_path: Path) -> tuple[int, ...] | None:
+    """GQA anchor layer indices recorded in a checkpoint (`None` for older checkpoints = default 7:1)."""
+    meta = json.loads((ckpt_path / "trainer_state.json").read_text(encoding="utf-8"))
+    kinds = meta.get("metrics", {}).get("layer_kinds")
+    return None if kinds is None else tuple(i for i, k in enumerate(kinds) if int(k) == 0)
+
+
 def save_atomic_checkpoint(
     ckpt_root: Path,
     step: int,
@@ -605,8 +622,16 @@ def stream_annotated_batches(
     code_ratio: float = 0.35,
     use_edge_hints: bool = True,
     skip_first_docs: int = 0,
+    skip_prose_docs: int | None = None,
+    skip_code_docs: int | None = None,
+    progress: dict[str, int] | None = None,
 ):
-    """Yield `(input_ids [B, T], hints [B, T, 4] | None, eos_reset_mask [B, T])` via dense packing."""
+    """Yield `(input_ids [B, T], hints [B, T, 4] | None, eos_reset_mask [B, T])` via dense packing.
+
+    `skip_prose_docs` / `skip_code_docs` (default: `skip_first_docs`) are absolute stream offsets.
+    `progress`, when given, is updated in place with the absolute index of the next unread document
+    in each stream (`prose_docs`, `code_docs`), so a resumed run can skip exactly what was consumed.
+    """
     from datasets import load_dataset
 
     codec = None
@@ -629,9 +654,16 @@ def stream_annotated_batches(
             load_dataset("codeparrot/codeparrot-clean-valid", split="train", streaming=True)
         )
 
-    for _ in range(skip_first_docs):
+    n_prose = skip_first_docs if skip_prose_docs is None else skip_prose_docs
+    n_code = skip_first_docs if skip_code_docs is None else skip_code_docs
+    for _ in range(n_prose):
         next(prose_ds, None)
+    for _ in range(n_code):
         next(code_ds, None)
+    if progress is None:
+        progress = {}
+    progress["prose_docs"] = n_prose
+    progress["code_docs"] = n_code
 
     eos_id = int(tokenizer.eos_token_id if getattr(tokenizer, "eos_token_id", None) is not None else 0)
     is_fast = bool(getattr(tokenizer, "is_fast", False))
@@ -652,6 +684,7 @@ def stream_annotated_batches(
             sample = next(code_ds) if use_code else next(prose_ds)
         except StopIteration:
             break
+        progress["code_docs" if use_code else "prose_docs"] += 1
         text = sample.get("content") or sample.get("text") or ""
         if len(text.strip()) < 64:
             continue
@@ -708,10 +741,15 @@ def collect_packed_eval_batches(
     num_batches: int = 12,
     seq_len: int = 512,
     batch_size: int = 2,
-    skip_first_docs: int = 64,
+    skip_first_docs: int = 0,
     use_edge_hints: bool = True,
 ) -> list[tuple[torch.LongTensor, torch.Tensor | None, torch.Tensor]]:
-    """Collect finite held-out packed validation batches without unmasked `<eos>` right-padding."""
+    """Collect held-out packed validation batches from the reserved head of each stream.
+
+    Validation reads documents `[skip_first_docs, EVAL_RESERVED_DOCS)`; training starts at
+    `EVAL_RESERVED_DOCS`, so the two never overlap. Raises if validation would spill past the reserve.
+    """
+    progress: dict[str, int] = {}
     stream = stream_annotated_batches(
         tokenizer,
         seq_len=seq_len,
@@ -719,8 +757,16 @@ def collect_packed_eval_batches(
         code_ratio=0.30,
         use_edge_hints=use_edge_hints,
         skip_first_docs=skip_first_docs,
+        progress=progress,
     )
-    return [next(stream) for _ in range(num_batches)]
+    batches = [next(stream) for _ in range(num_batches)]
+    used = max(progress["prose_docs"], progress["code_docs"])
+    if used > EVAL_RESERVED_DOCS:
+        raise ValueError(
+            f"validation consumed {used} docs, past EVAL_RESERVED_DOCS={EVAL_RESERVED_DOCS}; "
+            "raise the reserve or use fewer eval batches"
+        )
+    return batches
 
 
 @torch.no_grad()
@@ -892,6 +938,10 @@ def verify_checkpoint_health(
     if active_quant_lambda >= 1.0 - 1e-6:
         val_ppl_ternary = val_ppl_active
     else:
+        # Before lambda reaches 1 the weights are not row-prescaled, so plain `absmean` at lambda=1
+        # would score a ~25%-too-small scale that training never targets. Score the L2-optimal
+        # ternary form instead: the same function the model computes right after the prescale.
+        set_model_ternary_l2_scale(student, True)
         set_model_quant_lambda(student, 1.0)
         tern_nll = 0.0
         tern_toks = 0
@@ -909,6 +959,7 @@ def verify_checkpoint_health(
                 tern_nll += nll
                 tern_toks += n_tok
         val_ppl_ternary = math.exp(min(20.0, tern_nll / max(tern_toks, 1)))
+        set_model_ternary_l2_scale(student, False)
         set_model_quant_lambda(student, active_quant_lambda)
 
     probe_ids = val_batches[0][0][:1, : min(16, int(val_batches[0][0].shape[1]))].to(device)
@@ -1013,6 +1064,16 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--log-every", type=int, default=1)
+    parser.add_argument(
+        "--delta-rule",
+        action="store_true",
+        help="Recurrence layers erase the old value for a key before writing (delta rule) instead of only adding",
+    )
+    parser.add_argument(
+        "--write-gate",
+        action="store_true",
+        help="Recurrence layers learn a per-token importance that scales how strongly each token is written",
+    )
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=8)
@@ -1031,6 +1092,19 @@ def main() -> None:
         help="Raise RuntimeError immediately if checkpoint verification status is FAIL (default: True)",
     )
     parser.add_argument("--no-edge-hints", action="store_true")
+    parser.add_argument(
+        "--anchor-every",
+        type=int,
+        default=8,
+        help="Keep every Nth layer as exact GQA (8 = 7:1 hybrid, 4 = 3:1, 2 = 1:1, 1 = no recurrence)",
+    )
+    parser.add_argument(
+        "--write-gate-sup",
+        type=float,
+        default=0.0,
+        help="Weight of the loss pulling each write gate toward the attention the teacher's later tokens "
+        "pay that token (needs --write-gate; switches the teacher to eager attention)",
+    )
     parser.add_argument("--dry-run-mini", action="store_true", help="Run tiny local smoke test verifying checkpoint & resume")
     args = parser.parse_args()
 
@@ -1058,6 +1132,7 @@ def main() -> None:
         hidden_mse_weight=0.5,
         lookahead_weight=0.2,
         load_balance_coef=0.05,
+        write_gate_weight=args.write_gate_sup,
         temperature=2.0,
     )
 
@@ -1091,6 +1166,14 @@ def main() -> None:
             enable_hint_embedding=not args.no_edge_hints,
             deepcopy_model=True,
         )
+        for mod in student.modules():
+            if isinstance(mod, GatedLinearRecurrenceAttention):
+                if args.delta_rule:
+                    mod.enable_delta_rule()
+                if args.write_gate:
+                    # Supervised gates start at 0.5 (near the mean target): from +4 the small LR
+                    # only moves the gate ~0.98 -> ~0.9 in 500 steps.
+                    mod.enable_write_gate(init_bias=0.0 if args.write_gate_sup > 0.0 else 4.0)
         teacher = teacher.to(device)
         student = student.to(device)
 
@@ -1127,6 +1210,9 @@ def main() -> None:
         )
         student, lookahead_bank, layer_kinds = build_student_from_teacher(
             cpu_base,
+            anchor_layers=default_anchor_layers(
+                cpu_base.config.num_hidden_layers, block_ratio=args.anchor_every
+            ),
             use_rms_prescale=False,
             init_l2_scale=False,
             enable_hint_embedding=not args.no_edge_hints,
@@ -1138,6 +1224,14 @@ def main() -> None:
             # A100-40GB memory budget: keep core BitLinear, norms, routers, decay_proj,
             # and hint_embedding in FP32 while storing large BitLinearExperts in BF16.
             stochastic_round_bf16_params_(student)
+        for mod in student.modules():
+            if isinstance(mod, GatedLinearRecurrenceAttention):
+                if args.delta_rule:
+                    mod.enable_delta_rule()
+                if args.write_gate:
+                    # Supervised gates start at 0.5 (near the mean target): from +4 the small LR
+                    # only moves the gate ~0.98 -> ~0.9 in 500 steps.
+                    mod.enable_write_gate(init_bias=0.0 if args.write_gate_sup > 0.0 else 4.0)
         if hasattr(student.backbone, "gradient_checkpointing_enable"):
             student.backbone.gradient_checkpointing_enable()
         student = student.to(device)
@@ -1148,20 +1242,13 @@ def main() -> None:
             num_batches=max(1, args.verify_batches),
             seq_len=min(args.seq_len, 512),
             batch_size=args.batch_size,
-            skip_first_docs=128,
             use_edge_hints=not args.no_edge_hints,
         )
-        batch_iter = (
-            None
-            if args.verify_only
-            else stream_annotated_batches(
-                tokenizer,
-                seq_len=args.seq_len,
-                batch_size=args.batch_size,
-                use_edge_hints=not args.no_edge_hints,
-            )
-        )
+        batch_iter = None  # created after resume so it can skip already-trained documents
         mini_batches = []
+
+    if args.write_gate_sup > 0.0:
+        teacher.set_attn_implementation("eager")  # sdpa does not return attention weights
 
     stage1_param_ids = collect_stage1_param_ids(student, lookahead_bank)
     optimizer = build_colab_optimizer(student, lookahead_bank, lr=args.lr)
@@ -1190,11 +1277,25 @@ def main() -> None:
                 saved_metrics = json.loads(state_file.read_text(encoding="utf-8")).get("metrics", {})
             except Exception:
                 saved_metrics = {}
+    data_progress: dict[str, int] = {}
+    if not args.dry_run_mini and not args.verify_only:
+        # Training never reads the validation reserve; on resume it continues after the docs already used.
+        batch_iter = stream_annotated_batches(
+            tokenizer,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            use_edge_hints=not args.no_edge_hints,
+            skip_prose_docs=max(EVAL_RESERVED_DOCS, int(saved_metrics.get("data_prose_docs", 0))),
+            skip_code_docs=max(EVAL_RESERVED_DOCS, int(saved_metrics.get("data_code_docs", 0))),
+            progress=data_progress,
+        )
     l2_prescaled = (
         bool(saved_metrics.get("l2_prescaled", 0.0))
         or float(saved_metrics.get("quant_lambda", 0.0)) >= 1.0 - 1e-6
         or start_step >= (stage1_steps + quant_warmup_steps)
     )
+    # The prescale record is not in `state_dict`; restore it so it can never be applied twice.
+    mark_model_l2_prescaled_(student, l2_prescaled)
 
     use_amp = gpu_profile["backend"] == "cuda"
     amp_ctx = (
@@ -1302,6 +1403,7 @@ def main() -> None:
                     input_ids=ids,
                     attention_mask=teacher_mask,
                     output_hidden_states=True,
+                    output_attentions=args.write_gate_sup > 0.0,
                     use_cache=False,
                 )
 
@@ -1312,6 +1414,7 @@ def main() -> None:
                     input_ids=ids,
                     teacher_logits=t_out.logits,
                     teacher_hidden_states=t_out.hidden_states,
+                    teacher_attentions=t_out.attentions,
                     hints=hints_dev,
                     eos_reset_mask=resets_dev,
                     weights=loss_weights,
@@ -1342,7 +1445,12 @@ def main() -> None:
                 f"[step {step_idx}/{args.steps} S{stage_id} lam={quant_lam:.2f}] "
                 f"loss={last_metrics['total_loss']:.4f} "
                 f"kl={last_metrics['kl_loss']:.4f} recall@k={last_metrics['mean_recall_at_k']:.4f} "
-                f"dt={step_dt:.2f}s{vram_str}",
+                + (
+                    f"wg={last_metrics['wg_mean']:.3f}/{last_metrics['wg_target_mean']:.3f} "
+                    if "wg_mean" in last_metrics
+                    else ""
+                )
+                + f"dt={step_dt:.2f}s{vram_str}",
                 flush=True,
             )
 
@@ -1384,6 +1492,10 @@ def main() -> None:
                 )
 
         if is_save_step:
+            last_metrics["layer_kinds"] = list(layer_kinds)
+            if data_progress:
+                last_metrics["data_prose_docs"] = data_progress["prose_docs"]
+                last_metrics["data_code_docs"] = data_progress["code_docs"]
             ckpt_path = save_atomic_checkpoint(
                 args.ckpt_dir,
                 step_idx,

@@ -169,6 +169,116 @@ mod integration_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn accounting_model(tag: &str) -> (std::path::PathBuf, SyntheticModelConfig) {
+        let dir = unique_temp_dir(tag);
+        let cfg = SyntheticModelConfig {
+            num_layers: 8,
+            num_experts: 16,
+            top_k: 2,
+            lookahead_offset: 3,
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 32,
+            ..SyntheticModelConfig::default()
+        };
+        write_synthetic_model_dir(&dir, &cfg).unwrap();
+        (dir, cfg)
+    }
+
+    #[test]
+    fn test_prefetch_credit_requires_same_token_use() {
+        use crate::nvme_pool::{ExpertLruPool, PoolSizingConfig};
+        let (dir, cfg) = accounting_model("prefetch_same_token_credit");
+        let open = || {
+            ExpertLruPool::open(
+                &dir.join("experts.bin"),
+                cfg.top_k,
+                PoolSizingConfig { max_cached_experts: Some(8), ..Default::default() },
+            )
+            .unwrap()
+        };
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Prefetched and used within one token: credited to the lookahead router.
+        let mut pool = open();
+        pool.begin_token();
+        pool.prefetch_layer_experts(3, &[1, 5]).unwrap();
+        settle();
+        pool.acquire_layer_experts(3, &[1, 5]).unwrap();
+        pool.release_layer_experts(3, &[1, 5]);
+        let m = pool.metrics().clone();
+        assert_eq!((m.prefetched_hits, m.stale_prefetch_hits, m.cold_misses), (2, 0, 0), "{m:?}");
+        assert_eq!(m.prefetch_precision(), 1.0);
+        assert_eq!(m.prefetch_wasted_bytes(), 0);
+
+        // Prefetched in one token, used in a later one: a cache hit, but NOT a lookahead hit.
+        let mut pool = open();
+        pool.begin_token();
+        pool.prefetch_layer_experts(3, &[1, 5]).unwrap();
+        settle();
+        pool.begin_token();
+        pool.acquire_layer_experts(3, &[1, 5]).unwrap();
+        pool.release_layer_experts(3, &[1, 5]);
+        let m = pool.metrics().clone();
+        assert_eq!((m.prefetched_hits, m.stale_prefetch_hits, m.cold_misses), (0, 2, 0), "{m:?}");
+        assert_eq!(m.prefetch_precision(), 0.0);
+        assert_eq!(m.prefetch_wasted_bytes(), m.prefetch_bytes_read);
+        assert_eq!(m.effective_hit_rate(), 1.0);
+
+        // A wrong prediction is a cold miss for the expert that was actually needed.
+        let mut pool = open();
+        pool.begin_token();
+        pool.prefetch_layer_experts(3, &[1, 5]).unwrap();
+        settle();
+        pool.acquire_layer_experts(3, &[2, 6]).unwrap();
+        pool.release_layer_experts(3, &[2, 6]);
+        let m = pool.metrics().clone();
+        assert_eq!((m.prefetched_hits, m.cold_misses), (0, 2), "{m:?}");
+        assert_eq!(m.total_acquisitions(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lookahead_credit_is_bounded_by_prediction_recall() {
+        // Everything fits in the pool, so the cache hit rate is high whatever the router predicts.
+        // The lookahead-attributed share must be bounded by how often the router was actually right,
+        // not track the cache hit rate. (The chance-level check on a router with no predictive power
+        // needs the full-size `--synthetic` export; see IMPLEMENTATION_REPORT.md.)
+        let (dir, cfg) = accounting_model("lookahead_credit_bound");
+        let mut engine = TerraEngine::open_dir(
+            &dir,
+            EngineConfig {
+                ram_budget_mb: None,
+                max_cached_experts: None,
+                enable_lookahead_prefetch: true,
+                kv_reserve_tokens: 512,
+            },
+        )
+        .unwrap();
+        let prompt: Vec<u32> = (0..64).collect();
+        let report = engine.generate_greedy(&prompt, 257).unwrap();
+        let m = &report.prefetch_metrics;
+        let tokens = (report.prompt_tokens + report.decode_steps) as u64;
+        assert_eq!(
+            m.total_acquisitions(),
+            tokens * (cfg.num_layers * cfg.top_k) as u64,
+            "every acquisition must be classified exactly once: {m:?}"
+        );
+        let credited = 100.0 * (m.prefetched_hits + m.prefetch_late) as f64
+            / m.total_acquisitions() as f64;
+        assert!(report.cache_hit_rate_pct > 90.0, "{report:?}");
+        assert!(report.lookahead_recall_at_k_pct > 0.0 && report.lookahead_recall_at_k_pct < 100.0);
+        assert!(
+            credited <= report.lookahead_recall_at_k_pct,
+            "credited {credited:.2}% of acquisitions to a router with {:.2}% recall",
+            report.lookahead_recall_at_k_pct
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_ram_budget_mb_enforcement_and_zipfian_cache_hits() {
         // 8 layers x 8 experts = 64 experts; with 32-slot cache (`1 MB` budget), hot experts stay cached across tokens!
@@ -722,7 +832,10 @@ mod integration_tests {
             }
             if tok_overlap_case.is_none()
                 && touched_l3 == needed_l3
-                && l_eng.nvme_pool().metrics().prefetched_hits == cfg.top_k as u64
+                && {
+                    let m = l_eng.nvme_pool().metrics();
+                    m.prefetched_hits + m.prefetch_late == cfg.top_k as u64
+                }
             {
                 tok_overlap_case = Some((tok, needed_l3[0], clean_logits));
             }
