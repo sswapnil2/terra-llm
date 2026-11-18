@@ -123,13 +123,13 @@ def main() -> int:
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from colab.run_eval_only import _eval_humaneval_pass1
-    from train.distill import build_student_from_teacher, evaluate_perplexity, export_distilled_student
+    from train.distill import evaluate_perplexity, export_distilled_student
     from train.distill_colab import (
-        anchor_layers_from_checkpoint,
-        collect_packed_eval_batches,
+            collect_packed_eval_batches,
         detect_gpu_profile,
         evaluate_lookahead_recall,
         load_frozen_teacher,
+    load_student_checkpoint,
     )
 
     args.export_dir.mkdir(parents=True, exist_ok=True)
@@ -151,23 +151,13 @@ def main() -> int:
         dtype=torch.float32,
         low_cpu_mem_usage=True,
     )
-    student, lookahead_bank, layer_kinds = build_student_from_teacher(
-        cpu_base,
-        anchor_layers=anchor_layers_from_checkpoint(ckpt_path),
-        use_rms_prescale=False,
-        init_l2_scale=False,
-        enable_hint_embedding=True,
-        deepcopy_model=False,
-    )
+    student, lookahead_bank, layer_kinds, ckpt_info = load_student_checkpoint(cpu_base, ckpt_path)
     del cpu_base
     gc.collect()
-
-    student.load_state_dict(
-        torch.load(ckpt_path / "student_state.pt", map_location="cpu", weights_only=True)
-    )
-    lookahead_bank.load_state_dict(
-        torch.load(ckpt_path / "lookahead_state.pt", map_location="cpu", weights_only=True)
-    )
+    if ckpt_info["delta_rule"] or ckpt_info["write_gate"]:
+        # The exporter and Rust `state.rs` implement the additive write rule only; exporting would
+        # silently drop erase_proj / write_proj and ship a different model.
+        raise SystemExit(f"Cannot export this checkpoint, the runtime has no delta rule / write gate: {ckpt_info}")
 
     print("[final 2/7] Exporting distilled 1.58-bit core.bin + 4KB-aligned experts.bin + golden_ref.json...", flush=True)
     export_info = export_distilled_student(

@@ -445,6 +445,49 @@ def anchor_layers_from_checkpoint(ckpt_path: Path) -> tuple[int, ...] | None:
     return None if kinds is None else tuple(i for i, k in enumerate(kinds) if int(k) == 0)
 
 
+def load_student_checkpoint(
+    base_model: nn.Module, ckpt_path: Path
+) -> tuple[MicroTerraHybridWrapper, LookaheadRouterBank, list[int], dict[str, Any]]:
+    """Rebuild the student a checkpoint was trained as, and load it (strict).
+
+    The variant is read from the checkpoint itself: anchor layout and quantization blend from
+    `trainer_state.json`, hint embedding / delta rule / write gate from the `state_dict` keys,
+    so eval and export never need the training command line.
+    """
+    state = torch.load(ckpt_path / "student_state.pt", map_location="cpu", weights_only=True)
+    metrics = json.loads((ckpt_path / "trainer_state.json").read_text(encoding="utf-8")).get("metrics", {})
+    info = {
+        "hints": any("hint_embedding" in k for k in state),
+        "delta_rule": any(".erase_proj." in k for k in state),
+        "write_gate": any(".write_proj." in k for k in state),
+        # Checkpoints older than the staged trainer carry no blend; they were saved fully ternary.
+        "quant_lambda": float(metrics.get("quant_lambda", 1.0)),
+    }
+    student, lookahead_bank, layer_kinds = build_student_from_teacher(
+        base_model,
+        anchor_layers=anchor_layers_from_checkpoint(ckpt_path),
+        use_rms_prescale=False,
+        init_l2_scale=False,
+        enable_hint_embedding=info["hints"],
+        deepcopy_model=False,
+    )
+    for mod in student.modules():
+        if isinstance(mod, GatedLinearRecurrenceAttention):
+            if info["delta_rule"]:
+                mod.enable_delta_rule()
+            if info["write_gate"]:
+                mod.enable_write_gate()
+    student.load_state_dict(state)
+    lookahead_bank.load_state_dict(
+        torch.load(ckpt_path / "lookahead_state.pt", map_location="cpu", weights_only=True)
+    )
+    set_model_quant_lambda(student, info["quant_lambda"])
+    mark_model_l2_prescaled_(
+        student, bool(metrics.get("l2_prescaled", 0.0)) or info["quant_lambda"] >= 1.0 - 1e-6
+    )
+    return student, lookahead_bank, layer_kinds, info
+
+
 def save_atomic_checkpoint(
     ckpt_root: Path,
     step: int,
@@ -1116,6 +1159,12 @@ def main() -> None:
             fallback.mkdir(parents=True, exist_ok=True)
             print(f"[Micro-TERRA Colab] Warning: {args.ckpt_dir} not writable; falling back to {fallback}", flush=True)
             args.ckpt_dir = fallback
+    if Path("/content").is_dir() and not str(args.ckpt_dir.resolve()).startswith("/content/drive/"):
+        print(
+            f"[Micro-TERRA Colab] WARNING: --ckpt-dir {args.ckpt_dir} is on the runtime disk and is lost when "
+            "the runtime ends. Mount Drive and use /content/drive/MyDrive/<run-name>.",
+            flush=True,
+        )
 
     stage1_steps = max(1, args.steps // 4) if args.stage1_steps < 0 else args.stage1_steps
     quant_warmup_steps = max(1, args.steps // 5) if args.quant_warmup_steps < 0 else args.quant_warmup_steps

@@ -36,13 +36,13 @@ if str(_REPO_ROOT) not in sys.path:
 
 from edge_codec import UnifiedEdgeCodec
 from exporter.export_olmoe import run_reference_forward
-from train.distill import build_student_from_teacher, evaluate_perplexity
+from train.distill import evaluate_perplexity
 from train.distill_colab import (
-    anchor_layers_from_checkpoint,
     collect_packed_eval_batches,
     detect_gpu_profile,
     evaluate_lookahead_recall,
     load_frozen_teacher,
+    load_student_checkpoint,
 )
 
 
@@ -203,23 +203,10 @@ def main() -> int:
         dtype=torch.float32,
         low_cpu_mem_usage=True,
     )
-    student, lookahead_bank, layer_kinds = build_student_from_teacher(
-        cpu_base,
-        anchor_layers=anchor_layers_from_checkpoint(ckpt_path),
-        use_rms_prescale=False,
-        init_l2_scale=False,
-        enable_hint_embedding=True,
-        deepcopy_model=False,
-    )
+    student, lookahead_bank, layer_kinds, ckpt_info = load_student_checkpoint(cpu_base, ckpt_path)
     del cpu_base
     gc.collect()
-
-    student.load_state_dict(
-        torch.load(ckpt_path / "student_state.pt", map_location="cpu", weights_only=True)
-    )
-    lookahead_bank.load_state_dict(
-        torch.load(ckpt_path / "lookahead_state.pt", map_location="cpu", weights_only=True)
-    )
+    print(f"[eval] checkpoint variant: {ckpt_info}", flush=True)
     student = student.to(device=device)
     lookahead_bank = lookahead_bank.to(device=device)
     student.eval()
