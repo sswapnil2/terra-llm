@@ -55,3 +55,27 @@ def test_write_gate_scales_writes():
     assert blk.forward_parallel(x).abs().max() < 1e-6
     blk.write_proj = None
     assert not torch.allclose(gated, blk.forward_parallel(x), atol=1e-3)
+
+
+def test_write_gate_loss_pulls_gate_to_received_attention():
+    from types import SimpleNamespace
+
+    from train.distill import compute_write_gate_loss
+
+    torch.manual_seed(0)
+    block = _block()
+    layer = SimpleNamespace(self_attn=block, input_layernorm=torch.nn.Identity())
+    student = SimpleNamespace(backbone=SimpleNamespace(model=SimpleNamespace(layers=[layer])))
+    hidden = torch.randn(2, 12, 32)
+    # Every later token attends only to token 0: token 0 is important, the rest are not.
+    attn = torch.zeros(2, 4, 12, 12)
+    attn[:, :, :, 0] = 1.0
+    opt = torch.optim.Adam(block.write_proj.parameters(), lr=0.1)
+    for _ in range(200):
+        loss, stats = compute_write_gate_loss(student, (hidden,), (attn,), tail=2)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    gate = torch.sigmoid(block.write_proj(hidden))
+    assert gate[:, 0].min() > 0.9 and gate[:, 1:10].max() < 0.1
+    assert 0.0 < stats["wg_target_mean"] < 0.2

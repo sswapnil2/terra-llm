@@ -112,6 +112,7 @@ class DistillLossWeights:
     lookahead_weight: float = 0.25
     temperature: float = 2.0
     load_balance_coef: float = 0.01
+    write_gate_weight: float = 0.0
 
 
 def compute_kl_distillation_loss(
@@ -220,6 +221,44 @@ def build_student_from_teacher(
     return wrapper, lookahead_bank, layer_kinds
 
 
+def compute_write_gate_loss(
+    student: MicroTerraHybridWrapper,
+    student_hidden_states: tuple[torch.Tensor, ...],
+    teacher_attentions: tuple[torch.Tensor, ...],
+    tail: int = 64,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """BCE between each recurrence layer's write gate and the attention the teacher's later tokens pay that token.
+
+    Target per (token, head) = attention mass received from later tokens in the same teacher layer/head,
+    clamped to 1: a token nobody reads back should not be written, one read by >= one query-worth should.
+    The gate is recomputed from the layer input (detached), so this works under gradient checkpointing
+    and trains only `write_proj`.
+    """
+    losses, gate_means, target_means = [], [], []
+    for idx, layer in enumerate(student.backbone.model.layers):
+        proj = getattr(layer.self_attn, "write_proj", None)
+        if proj is None:
+            continue
+        attn = teacher_attentions[idx].float()  # [B, H, T_query, T_key]
+        received = attn.sum(dim=2) - attn.diagonal(dim1=-2, dim2=-1)  # [B, H, T]
+        target = received.clamp(max=1.0).transpose(1, 2)  # [B, T, H]
+        # ponytail: the last tokens have few later readers, so their target is biased low; just drop them.
+        # Tokens right before a packed-document boundary have the same bias and are left in.
+        keep = max(1, target.shape[1] - min(tail, target.shape[1] // 2))
+        h = layer.input_layernorm(student_hidden_states[idx]).detach().float()
+        logits = proj(h).float()[:, :keep]
+        target = target[:, :keep]
+        losses.append(F.binary_cross_entropy_with_logits(logits, target))
+        gate_means.append(torch.sigmoid(logits.detach()).mean())
+        target_means.append(target.mean())
+    if not losses:
+        raise ValueError("write-gate supervision needs --write-gate (no recurrence layer has write_proj)")
+    return torch.stack(losses).mean(), {
+        "wg_mean": float(torch.stack(gate_means).mean().item()),
+        "wg_target_mean": float(torch.stack(target_means).mean().item()),
+    }
+
+
 def distill_step(
     student: MicroTerraHybridWrapper,
     lookahead_bank: LookaheadRouterBank,
@@ -227,6 +266,7 @@ def distill_step(
     teacher_logits: torch.Tensor,
     teacher_hidden_states: tuple[torch.Tensor, ...],
     teacher_router_logits: tuple[torch.Tensor, ...] | dict[int, torch.Tensor] | None = None,
+    teacher_attentions: tuple[torch.Tensor, ...] | None = None,
     hints: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
     eos_reset_mask: torch.Tensor | None = None,
@@ -269,6 +309,12 @@ def distill_step(
         "hidden_mse": float(hid_mse.item()),
         **look_stats,
     }
+    if weights.write_gate_weight > 0.0:
+        if teacher_attentions is None:
+            raise ValueError("write_gate_weight > 0 needs teacher attentions (teacher must use eager attention)")
+        wg_loss, wg_stats = compute_write_gate_loss(student, student_out.hidden_states, teacher_attentions)
+        total_loss = total_loss + weights.write_gate_weight * wg_loss
+        metrics.update(total_loss=float(total_loss.item()), wg_loss=float(wg_loss.item()), **wg_stats)
     return total_loss, metrics
 
 

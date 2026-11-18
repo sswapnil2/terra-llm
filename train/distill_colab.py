@@ -1087,6 +1087,13 @@ def main() -> None:
         default=8,
         help="Keep every Nth layer as exact GQA (8 = 7:1 hybrid, 4 = 3:1, 2 = 1:1, 1 = no recurrence)",
     )
+    parser.add_argument(
+        "--write-gate-sup",
+        type=float,
+        default=0.0,
+        help="Weight of the loss pulling each write gate toward the attention the teacher's later tokens "
+        "pay that token (needs --write-gate; switches the teacher to eager attention)",
+    )
     parser.add_argument("--dry-run-mini", action="store_true", help="Run tiny local smoke test verifying checkpoint & resume")
     args = parser.parse_args()
 
@@ -1114,6 +1121,7 @@ def main() -> None:
         hidden_mse_weight=0.5,
         lookahead_weight=0.2,
         load_balance_coef=0.05,
+        write_gate_weight=args.write_gate_sup,
         temperature=2.0,
     )
 
@@ -1223,6 +1231,9 @@ def main() -> None:
         )
         batch_iter = None  # created after resume so it can skip already-trained documents
         mini_batches = []
+
+    if args.write_gate_sup > 0.0:
+        teacher.set_attn_implementation("eager")  # sdpa does not return attention weights
 
     stage1_param_ids = collect_stage1_param_ids(student, lookahead_bank)
     optimizer = build_colab_optimizer(student, lookahead_bank, lr=args.lr)
@@ -1375,6 +1386,7 @@ def main() -> None:
                     input_ids=ids,
                     attention_mask=teacher_mask,
                     output_hidden_states=True,
+                    output_attentions=args.write_gate_sup > 0.0,
                     use_cache=False,
                 )
 
@@ -1385,6 +1397,7 @@ def main() -> None:
                     input_ids=ids,
                     teacher_logits=t_out.logits,
                     teacher_hidden_states=t_out.hidden_states,
+                    teacher_attentions=t_out.attentions,
                     hints=hints_dev,
                     eos_reset_mask=resets_dev,
                     weights=loss_weights,
@@ -1415,7 +1428,12 @@ def main() -> None:
                 f"[step {step_idx}/{args.steps} S{stage_id} lam={quant_lam:.2f}] "
                 f"loss={last_metrics['total_loss']:.4f} "
                 f"kl={last_metrics['kl_loss']:.4f} recall@k={last_metrics['mean_recall_at_k']:.4f} "
-                f"dt={step_dt:.2f}s{vram_str}",
+                + (
+                    f"wg={last_metrics['wg_mean']:.3f}/{last_metrics['wg_target_mean']:.3f} "
+                    if "wg_mean" in last_metrics
+                    else ""
+                )
+                + f"dt={step_dt:.2f}s{vram_str}",
                 flush=True,
             )
 
