@@ -1160,7 +1160,9 @@ def main() -> None:
                 if args.delta_rule:
                     mod.enable_delta_rule()
                 if args.write_gate:
-                    mod.enable_write_gate()
+                    # Supervised gates start at 0.5 (near the mean target): from +4 the small LR
+                    # only moves the gate ~0.98 -> ~0.9 in 500 steps.
+                    mod.enable_write_gate(init_bias=0.0 if args.write_gate_sup > 0.0 else 4.0)
         teacher = teacher.to(device)
         student = student.to(device)
 
@@ -1216,7 +1218,9 @@ def main() -> None:
                 if args.delta_rule:
                     mod.enable_delta_rule()
                 if args.write_gate:
-                    mod.enable_write_gate()
+                    # Supervised gates start at 0.5 (near the mean target): from +4 the small LR
+                    # only moves the gate ~0.98 -> ~0.9 in 500 steps.
+                    mod.enable_write_gate(init_bias=0.0 if args.write_gate_sup > 0.0 else 4.0)
         if hasattr(student.backbone, "gradient_checkpointing_enable"):
             student.backbone.gradient_checkpointing_enable()
         student = student.to(device)
