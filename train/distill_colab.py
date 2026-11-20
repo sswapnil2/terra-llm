@@ -547,6 +547,20 @@ def save_atomic_checkpoint(
     return final_dir
 
 
+def _unpage_loaded_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+    """Clear bitsandbytes' `is_paged` mark on optimizer state that came from a checkpoint.
+
+    `PagedAdamW8bit` tags its CUDA-managed state tensors with an `is_paged` attribute. `torch.save`
+    keeps the attribute, but `torch.load` returns ordinary tensors, and prefetching those as managed
+    memory aborts the first resumed step ("Error invalid argument ... pythonInterface.cpp").
+    """
+    for opt in (optimizer, getattr(optimizer, "fp32_opt", None)):
+        for state in getattr(opt, "state", {}).values():
+            for value in state.values():
+                if getattr(value, "is_paged", False):
+                    value.is_paged = False
+
+
 def maybe_resume_latest(
     ckpt_root: Path,
     student: MicroTerraHybridWrapper,
@@ -588,6 +602,7 @@ def maybe_resume_latest(
     optimizer.load_state_dict(
         torch.load(ckpt_dir / "optimizer_state.pt", map_location=map_location, weights_only=False)
     )
+    _unpage_loaded_optimizer_state(optimizer)
     if scheduler is not None and (ckpt_dir / "scheduler_state.pt").is_file():
         scheduler.load_state_dict(
             torch.load(ckpt_dir / "scheduler_state.pt", map_location=map_location, weights_only=False)

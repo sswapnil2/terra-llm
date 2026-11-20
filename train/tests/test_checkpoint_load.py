@@ -8,7 +8,7 @@ from transformers import OlmoeConfig, OlmoeForCausalLM
 
 from train.bitlinear import set_model_quant_lambda
 from train.distill import build_student_from_teacher
-from train.distill_colab import load_student_checkpoint, save_atomic_checkpoint
+from train.distill_colab import _unpage_loaded_optimizer_state, load_student_checkpoint, save_atomic_checkpoint
 from train.hybrid_ssm import GatedLinearRecurrenceAttention
 
 
@@ -51,3 +51,17 @@ def test_round_trip_reproduces_logits(tmp_path, delta, gate, hints, lam):
         want = student(input_ids=ids, use_cache=False).logits
         got = loaded.eval()(input_ids=ids, use_cache=False).logits
     assert torch.allclose(got, want, atol=1e-5), (got - want).abs().max()
+
+
+def test_resumed_optimizer_state_is_not_treated_as_paged(tmp_path):
+    marked = torch.zeros(3)
+    marked.is_paged = True  # what bitsandbytes sets on CUDA-managed state
+    torch.save({"state1": marked}, tmp_path / "opt.pt")
+    loaded = torch.load(tmp_path / "opt.pt", weights_only=False)["state1"]
+    assert loaded.is_paged  # the mark survives the round trip; the managed memory does not
+
+    p = torch.nn.Parameter(torch.zeros(3))
+    opt = torch.optim.SGD([p], lr=0.1)
+    opt.state[p]["state1"] = loaded
+    _unpage_loaded_optimizer_state(opt)
+    assert not loaded.is_paged
